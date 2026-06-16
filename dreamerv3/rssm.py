@@ -179,20 +179,22 @@ class RSSM(nj.Module):
     m = min(self.fno_modes, d // 2 + 1)         # kept Fourier modes
 
     # --- spectral operator L[u]: FNO on deter reshaped to (B, g, d) ---
-    h = deter.reshape(B, g, d)
-    h_fft = jnp.fft.rfft(h, axis=-1)            # (B, g, d//2+1) complex
+    # rfft requires float32; cast up, operate, cast back to compute dtype
+    compute_dtype = deter.dtype
+    h = deter.reshape(B, g, d).astype(jnp.float32)
+    h_fft = jnp.fft.rfft(h, axis=-1)            # (B, g, d//2+1) complex64
     h_fft_m = h_fft[..., :m]                    # (B, g, m) keep low-freq modes
     # Represent complex modes as stacked real/imag, mix with a linear layer
     h_ri = jnp.concatenate(
-        [h_fft_m.real, h_fft_m.imag], axis=-1)  # (B, g, 2m)
-    h_ri = h_ri.reshape(B, g * 2 * m)
+        [h_fft_m.real, h_fft_m.imag], axis=-1)  # (B, g, 2m) float32
+    h_ri = h_ri.reshape(B, g * 2 * m).astype(compute_dtype)
     h_ri = self.sub('fno_spec', nn.Linear, g * 2 * m, **self.kw)(h_ri)
-    h_ri = h_ri.reshape(B, g, 2 * m)
+    h_ri = h_ri.reshape(B, g, 2 * m).astype(jnp.float32)
     # Reconstruct complex spectrum and pad high frequencies with zero
     h_fft_new = jnp.zeros_like(h_fft).at[..., :m].set(
         h_ri[..., :m] + 1j * h_ri[..., m:])
-    h_spectral = jnp.fft.irfft(h_fft_new, n=d, axis=-1)  # (B, g, d) real
-    h_spectral = h_spectral.reshape(B, self.deter)
+    h_spectral = jnp.fft.irfft(h_fft_new, n=d, axis=-1)  # (B, g, d) float32
+    h_spectral = h_spectral.reshape(B, self.deter).astype(compute_dtype)
 
     # Bypass (local W path): standard block-linear in spatial domain
     h_local = self.sub(
