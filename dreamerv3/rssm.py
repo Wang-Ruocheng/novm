@@ -30,17 +30,12 @@ class RSSM(nj.Module):
   absolute: bool = False
   blocks: int = 8
   free_nats: float = 1.0
-  # Neural Operator dynamics: 'gru' uses original block-GRU; 'fno' uses FNO.
-  dyn: str = 'gru'
+  # Dynamics core: 'gru' = original block-GRU, 'fno' = neural operator.
+  core: str = 'gru'
   fno_modes: int = 16
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
-    if self.dyn == 'fno':
-      d = self.deter // self.blocks
-      assert d >= 4, f'deter//blocks={d} too small for FNO'
-      assert self.fno_modes <= d // 2 + 1, (
-          f'fno_modes={self.fno_modes} > d//2+1={d//2+1}')
     self.act_space = act_space
     self.kw = kw
 
@@ -141,7 +136,7 @@ class RSSM(nj.Module):
     return carry, entries, losses, feat, metrics
 
   def _core(self, deter, stoch, action):
-    if self.dyn == 'fno':
+    if self.core == 'fno':
       return self._core_fno(deter, stoch, action)
     return self._core_gru(deter, stoch, action)
 
