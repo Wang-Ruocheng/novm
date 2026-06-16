@@ -218,3 +218,9 @@ debug:
     .*\.hidden: 3
     .*\.blocks: 4
     .*\.depth: 2
+    .*\.fno_modes: 2
+
+# Neural Operator dynamics presets (append after --configs <env> to switch)
+fno:
+  agent.dyn.rssm.dyn: fno
+  agent.dyn.rssm.fno_modes: 16

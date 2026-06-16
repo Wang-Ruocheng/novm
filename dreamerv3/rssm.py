@@ -30,9 +30,17 @@ class RSSM(nj.Module):
   absolute: bool = False
   blocks: int = 8
   free_nats: float = 1.0
+  # Neural Operator dynamics: 'gru' uses original block-GRU; 'fno' uses FNO.
+  dyn: str = 'gru'
+  fno_modes: int = 16
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
+    if self.dyn == 'fno':
+      d = self.deter // self.blocks
+      assert d >= 4, f'deter//blocks={d} too small for FNO'
+      assert self.fno_modes <= d // 2 + 1, (
+          f'fno_modes={self.fno_modes} > d//2+1={d//2+1}')
     self.act_space = act_space
     self.kw = kw
 
@@ -133,6 +141,11 @@ class RSSM(nj.Module):
     return carry, entries, losses, feat, metrics
 
   def _core(self, deter, stoch, action):
+    if self.dyn == 'fno':
+      return self._core_fno(deter, stoch, action)
+    return self._core_gru(deter, stoch, action)
+
+  def _core_gru(self, deter, stoch, action):
     stoch = stoch.reshape((stoch.shape[0], -1))
     action /= sg(jnp.maximum(1, jnp.abs(action)))
     g = self.blocks
@@ -156,6 +169,63 @@ class RSSM(nj.Module):
     cand = jnp.tanh(reset * cand)
     update = jax.nn.sigmoid(update - 1)
     deter = update * cand + (1 - update) * deter
+    return deter
+
+  def _core_fno(self, deter, stoch, action):
+    # PDE analogy: u_{t+1} = u_t + L[u_t] + f(a_t) + H(z_t)
+    #   L[u]   = spectral (FNO) operator on hidden state (autonomous dynamics)
+    #   f(a_t) = action forcing term
+    #   H(z_t) = stochastic term via posterior sample
+    stoch = stoch.reshape((stoch.shape[0], -1))
+    action /= sg(jnp.maximum(1, jnp.abs(action)))
+    B = deter.shape[0]
+    g = self.blocks
+    d = self.deter // g                          # spatial points per block
+    m = min(self.fno_modes, d // 2 + 1)         # kept Fourier modes
+
+    # --- spectral operator L[u]: FNO on deter reshaped to (B, g, d) ---
+    h = deter.reshape(B, g, d)
+    h_fft = jnp.fft.rfft(h, axis=-1)            # (B, g, d//2+1) complex
+    h_fft_m = h_fft[..., :m]                    # (B, g, m) keep low-freq modes
+    # Represent complex modes as stacked real/imag, mix with a linear layer
+    h_ri = jnp.concatenate(
+        [h_fft_m.real, h_fft_m.imag], axis=-1)  # (B, g, 2m)
+    h_ri = h_ri.reshape(B, g * 2 * m)
+    h_ri = self.sub('fno_spec', nn.Linear, g * 2 * m, **self.kw)(h_ri)
+    h_ri = h_ri.reshape(B, g, 2 * m)
+    # Reconstruct complex spectrum and pad high frequencies with zero
+    h_fft_new = jnp.zeros_like(h_fft).at[..., :m].set(
+        h_ri[..., :m] + 1j * h_ri[..., m:])
+    h_spectral = jnp.fft.irfft(h_fft_new, n=d, axis=-1)  # (B, g, d) real
+    h_spectral = h_spectral.reshape(B, self.deter)
+
+    # Bypass (local W path): standard block-linear in spatial domain
+    h_local = self.sub(
+        'fno_loc', nn.BlockLinear, self.deter, g, **self.kw)(deter)
+
+    # Merge spectral + local → autonomous candidate
+    cand = h_spectral + h_local
+    cand = nn.act(self.act)(self.sub('fno_candnorm', nn.Norm, self.norm)(cand))
+
+    # --- forcing term f(a_t) ---
+    forcing = self.sub('fno_force', nn.Linear, self.deter, **self.kw)(action)
+    forcing = nn.act(self.act)(
+        self.sub('fno_forcenorm', nn.Norm, self.norm)(forcing))
+
+    # --- stochastic term H(z_t) ---
+    noise = self.sub('fno_noise', nn.Linear, self.deter, **self.kw)(stoch)
+    noise = nn.act(self.act)(
+        self.sub('fno_noisenorm', nn.Norm, self.norm)(noise))
+
+    # Combined: L[u] + f(a) + H(z)
+    cand = cand + forcing + noise
+
+    # --- gated update (GRU-style, initialised near identity for stability) ---
+    # update gate biased to -1 so training starts close to identity map
+    update = jax.nn.sigmoid(
+        self.sub('fno_update', nn.Linear, self.deter, **self.kw)(
+            jnp.concatenate([deter, cand], -1)) - 1)
+    deter = update * jnp.tanh(cand) + (1 - update) * deter
     return deter
 
   def _prior(self, feat):
