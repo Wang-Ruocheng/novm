@@ -507,14 +507,20 @@ class NOWM(nj.Module):
     deter_prior = deter                              # prior deter: no observation info
     deter = self._spatial_observe(deter, tokens)    # update h_spatial per-location
     deter = self._vec_observe(deter, tokens)        # update h_vec from global pool
-    x = tokens if self.absolute else jnp.concatenate([deter, tokens], -1)
+    # obslogit uses prior_deter+tokens (mirrors RSSM): tokens is the ONLY obs-specific
+    # signal, so the model is forced to use it → KL stays non-zero during training.
+    # Using posterior_deter here caused KL collapse (deter already absorbed tokens).
+    x = tokens if self.absolute else jnp.concatenate([deter_prior, tokens], -1)
     for i in range(self.obslayers):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
     logit = self._logit('obslogit', x)
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+    # carry/entry use posterior_deter so FNO has spatial memory for the next step.
+    # feat['deter'] uses prior_deter so stoch must encode observation for reconstruction,
+    # which keeps KL healthy — identical structure to RSSM.
     carry = dict(deter=deter, stoch=stoch)
-    feat = dict(deter=deter, prior_deter=deter_prior, stoch=stoch, logit=logit)
+    feat = dict(deter=deter_prior, prior_deter=deter_prior, stoch=stoch, logit=logit)
     entry = dict(deter=deter, stoch=stoch)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
