@@ -13,236 +13,6 @@ f32 = jnp.float32
 sg = jax.lax.stop_gradient
 
 
-class RSSM(nj.Module):
-
-  deter: int = 4096
-  hidden: int = 2048
-  stoch: int = 32
-  classes: int = 32
-  norm: str = 'rms'
-  act: str = 'gelu'
-  unroll: bool = False
-  unimix: float = 0.01
-  outscale: float = 1.0
-  imglayers: int = 2
-  obslayers: int = 1
-  dynlayers: int = 1
-  absolute: bool = False
-  blocks: int = 8
-  free_nats: float = 1.0
-  # Dynamics core: 'gru' = original block-GRU, 'fno' = neural operator.
-  core: str = 'gru'
-  fno_modes: int = 16
-
-  def __init__(self, act_space, **kw):
-    assert self.deter % self.blocks == 0
-    self.act_space = act_space
-    self.kw = kw
-
-  @property
-  def entry_space(self):
-    return dict(
-        deter=elements.Space(np.float32, self.deter),
-        stoch=elements.Space(np.float32, (self.stoch, self.classes)))
-
-  def initial(self, bsize):
-    carry = nn.cast(dict(
-        deter=jnp.zeros([bsize, self.deter], f32),
-        stoch=jnp.zeros([bsize, self.stoch, self.classes], f32)))
-    return carry
-
-  def truncate(self, entries, carry=None):
-    assert entries['deter'].ndim == 3, entries['deter'].shape
-    carry = jax.tree.map(lambda x: x[:, -1], entries)
-    return carry
-
-  def starts(self, entries, carry, nlast):
-    B = len(jax.tree.leaves(carry)[0])
-    return jax.tree.map(
-        lambda x: x[:, -nlast:].reshape((B * nlast, *x.shape[2:])), entries)
-
-  def observe(self, carry, tokens, action, reset, training, single=False):
-    carry, tokens, action = nn.cast((carry, tokens, action))
-    if single:
-      carry, (entry, feat) = self._observe(
-          carry, tokens, action, reset, training)
-      return carry, entry, feat
-    else:
-      unroll = jax.tree.leaves(tokens)[0].shape[1] if self.unroll else 1
-      carry, (entries, feat) = nj.scan(
-          lambda carry, inputs: self._observe(
-              carry, *inputs, training),
-          carry, (tokens, action, reset), unroll=unroll, axis=1)
-      return carry, entries, feat
-
-  def _observe(self, carry, tokens, action, reset, training):
-    deter, stoch, action = nn.mask(
-        (carry['deter'], carry['stoch'], action), ~reset)
-    action = nn.DictConcat(self.act_space, 1)(action)
-    action = nn.mask(action, ~reset)
-    deter = self._core(deter, stoch, action)
-    tokens = tokens.reshape((*deter.shape[:-1], -1))
-    x = tokens if self.absolute else jnp.concatenate([deter, tokens], -1)
-    for i in range(self.obslayers):
-      x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
-    logit = self._logit('obslogit', x)
-    stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
-    carry = dict(deter=deter, stoch=stoch)
-    feat = dict(deter=deter, stoch=stoch, logit=logit)
-    entry = dict(deter=deter, stoch=stoch)
-    assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
-    return carry, (entry, feat)
-
-  def imagine(self, carry, policy, length, training, single=False):
-    if single:
-      action = policy(sg(carry)) if callable(policy) else policy
-      actemb = nn.DictConcat(self.act_space, 1)(action)
-      deter = self._core(carry['deter'], carry['stoch'], actemb)
-      logit = self._prior(deter)
-      stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
-      carry = nn.cast(dict(deter=deter, stoch=stoch))
-      feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit))
-      assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
-      return carry, (feat, action)
-    else:
-      unroll = length if self.unroll else 1
-      if callable(policy):
-        carry, (feat, action) = nj.scan(
-            lambda c, _: self.imagine(c, policy, 1, training, single=True),
-            nn.cast(carry), (), length, unroll=unroll, axis=1)
-      else:
-        carry, (feat, action) = nj.scan(
-            lambda c, a: self.imagine(c, a, 1, training, single=True),
-            nn.cast(carry), nn.cast(policy), length, unroll=unroll, axis=1)
-      # We can also return all carry entries but it might be expensive.
-      # entries = dict(deter=feat['deter'], stoch=feat['stoch'])
-      # return carry, entries, feat, action
-      return carry, feat, action
-
-  def loss(self, carry, tokens, acts, reset, training):
-    metrics = {}
-    carry, entries, feat = self.observe(carry, tokens, acts, reset, training)
-    prior = self._prior(feat['deter'])
-    post = feat['logit']
-    dyn = self._dist(sg(post)).kl(self._dist(prior))
-    rep = self._dist(post).kl(self._dist(sg(prior)))
-    if self.free_nats:
-      dyn = jnp.maximum(dyn, self.free_nats)
-      rep = jnp.maximum(rep, self.free_nats)
-    losses = {'dyn': dyn, 'rep': rep}
-    metrics['dyn_ent'] = self._dist(prior).entropy().mean()
-    metrics['rep_ent'] = self._dist(post).entropy().mean()
-    return carry, entries, losses, feat, metrics
-
-  def _core(self, deter, stoch, action):
-    if self.core == 'fno':
-      return self._core_fno(deter, stoch, action)
-    return self._core_gru(deter, stoch, action)
-
-  def _core_gru(self, deter, stoch, action):
-    stoch = stoch.reshape((stoch.shape[0], -1))
-    action /= sg(jnp.maximum(1, jnp.abs(action)))
-    g = self.blocks
-    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
-    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
-    x0 = self.sub('dynin0', nn.Linear, self.hidden, **self.kw)(deter)
-    x0 = nn.act(self.act)(self.sub('dynin0norm', nn.Norm, self.norm)(x0))
-    x1 = self.sub('dynin1', nn.Linear, self.hidden, **self.kw)(stoch)
-    x1 = nn.act(self.act)(self.sub('dynin1norm', nn.Norm, self.norm)(x1))
-    x2 = self.sub('dynin2', nn.Linear, self.hidden, **self.kw)(action)
-    x2 = nn.act(self.act)(self.sub('dynin2norm', nn.Norm, self.norm)(x2))
-    x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
-    x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
-    for i in range(self.dynlayers):
-      x = self.sub(f'dynhid{i}', nn.BlockLinear, self.deter, g, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'dynhid{i}norm', nn.Norm, self.norm)(x))
-    x = self.sub('dyngru', nn.BlockLinear, 3 * self.deter, g, **self.kw)(x)
-    gates = jnp.split(flat2group(x), 3, -1)
-    reset, cand, update = [group2flat(x) for x in gates]
-    reset = jax.nn.sigmoid(reset)
-    cand = jnp.tanh(reset * cand)
-    update = jax.nn.sigmoid(update - 1)
-    deter = update * cand + (1 - update) * deter
-    return deter
-
-  def _core_fno(self, deter, stoch, action):
-    # PDE analogy: u_{t+1} = u_t + L[u_t] + f(a_t) + H(z_t)
-    #   L[u]   = spectral (FNO) operator on hidden state (autonomous dynamics)
-    #   f(a_t) = action forcing term
-    #   H(z_t) = stochastic term via posterior sample
-    stoch = stoch.reshape((stoch.shape[0], -1))
-    action /= sg(jnp.maximum(1, jnp.abs(action)))
-    B = deter.shape[0]
-    g = self.blocks
-    d = self.deter // g                          # spatial points per block
-    m = min(self.fno_modes, d // 2 + 1)         # kept Fourier modes
-
-    # --- spectral operator L[u]: FNO on deter reshaped to (B, g, d) ---
-    # rfft requires float32; cast up, operate, cast back to compute dtype
-    compute_dtype = deter.dtype
-    h = deter.reshape(B, g, d).astype(jnp.float32)
-    h_fft = jnp.fft.rfft(h, axis=-1)            # (B, g, d//2+1) complex64
-    h_fft_m = h_fft[..., :m]                    # (B, g, m) keep low-freq modes
-    # Represent complex modes as stacked real/imag, mix with a linear layer
-    h_ri = jnp.concatenate(
-        [h_fft_m.real, h_fft_m.imag], axis=-1)  # (B, g, 2m) float32
-    h_ri = h_ri.reshape(B, g * 2 * m).astype(compute_dtype)
-    h_ri = self.sub('fno_spec', nn.Linear, g * 2 * m, **self.kw)(h_ri)
-    h_ri = h_ri.reshape(B, g, 2 * m).astype(jnp.float32)
-    # Reconstruct complex spectrum and pad high frequencies with zero
-    h_fft_new = jnp.zeros_like(h_fft).at[..., :m].set(
-        h_ri[..., :m] + 1j * h_ri[..., m:])
-    h_spectral = jnp.fft.irfft(h_fft_new, n=d, axis=-1)  # (B, g, d) float32
-    h_spectral = h_spectral.reshape(B, self.deter).astype(compute_dtype)
-
-    # Bypass (local W path): standard block-linear in spatial domain
-    h_local = self.sub(
-        'fno_loc', nn.BlockLinear, self.deter, g, **self.kw)(deter)
-
-    # Merge spectral + local → autonomous candidate
-    cand = h_spectral + h_local
-    cand = nn.act(self.act)(self.sub('fno_candnorm', nn.Norm, self.norm)(cand))
-
-    # --- forcing term f(a_t) ---
-    forcing = self.sub('fno_force', nn.Linear, self.deter, **self.kw)(action)
-    forcing = nn.act(self.act)(
-        self.sub('fno_forcenorm', nn.Norm, self.norm)(forcing))
-
-    # --- stochastic term H(z_t) ---
-    noise = self.sub('fno_noise', nn.Linear, self.deter, **self.kw)(stoch)
-    noise = nn.act(self.act)(
-        self.sub('fno_noisenorm', nn.Norm, self.norm)(noise))
-
-    # Combined: L[u] + f(a) + H(z)
-    cand = cand + forcing + noise
-
-    # --- gated update (GRU-style, initialised near identity for stability) ---
-    # update gate biased to -1 so training starts close to identity map
-    update = jax.nn.sigmoid(
-        self.sub('fno_update', nn.Linear, self.deter, **self.kw)(
-            jnp.concatenate([deter, cand], -1)) - 1)
-    deter = update * jnp.tanh(cand) + (1 - update) * deter
-    return deter
-
-  def _prior(self, feat):
-    x = feat
-    for i in range(self.imglayers):
-      x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
-    return self._logit('priorlogit', x)
-
-  def _logit(self, name, x):
-    kw = dict(**self.kw, outscale=self.outscale)
-    x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x)
-    return x.reshape(x.shape[:-1] + (self.stoch, self.classes))
-
-  def _dist(self, logits):
-    out = embodied.jax.outs.OneHot(logits, self.unimix)
-    out = embodied.jax.outs.Agg(out, 1, jnp.sum)
-    return out
-
-
 class Encoder(nj.Module):
 
   units: int = 1024
@@ -430,9 +200,13 @@ class NOWM(nj.Module):
   """Neural Operator World Model: 2D spatial h_spatial + global h_vec.
 
   carry['deter'] = concat(flatten(h_spatial), h_vec)  — flat for downstream
-  h_spatial (B, lat_size, lat_size, lat_chan): FNO-2D PDE dynamics
+  h_spatial (B, lat_size, lat_size, lat_chan): spatial dynamics via spatial_op
   h_vec     (B, deter): GRU global state
-  Cross-attention (4 heads) connects the two streams each step.
+
+  spatial_op choices:
+    'fno'  — Fourier Neural Operator (global spectral mixing, smooth PDEs)
+    'attn' — local self-attention (arbitrary spatial relations, discrete objects)
+    'conv' — 3×3 local convolution (local motion, fast)
   """
 
   # Global vector state h_vec
@@ -452,8 +226,14 @@ class NOWM(nj.Module):
   # Spatial field h_spatial (lat_size × lat_size × lat_chan)
   lat_size: int = 8
   lat_chan: int = 32
-  # FNO-2D: kept Fourier modes per spatial dimension
-  fno_modes: int = 4
+  # Spatial operator: 'fno' | 'attn' | 'conv'
+  spatial_op: str = 'attn'
+  attn_heads: int = 4        # used when spatial_op='attn'
+  fno_modes: int = 4         # used when spatial_op='fno'
+  # Spatial stochastic latent field: each location gets its own stoch variables.
+  # Enables per-location posterior and per-location stochastic PDE forcing.
+  # stoch_total = lat_size^2 * stoch; stoch/classes are now per-location counts.
+  stoch_spatial: bool = True
 
   def __init__(self, act_space, **kw):
     self.act_space = act_space
@@ -462,6 +242,12 @@ class NOWM(nj.Module):
   def _sp(self):
     return self.lat_size * self.lat_size * self.lat_chan
 
+  def _stoch_total(self):
+    """Total stoch variables: H*W*stoch (spatial) or stoch (global)."""
+    if self.stoch_spatial:
+      return self.lat_size * self.lat_size * self.stoch
+    return self.stoch
+
   def _total(self):
     return self._sp() + self.deter
 
@@ -469,12 +255,12 @@ class NOWM(nj.Module):
   def entry_space(self):
     return dict(
         deter=elements.Space(np.float32, self._total()),
-        stoch=elements.Space(np.float32, (self.stoch, self.classes)))
+        stoch=elements.Space(np.float32, (self._stoch_total(), self.classes)))
 
   def initial(self, bsize):
     return nn.cast(dict(
         deter=jnp.zeros([bsize, self._total()], f32),
-        stoch=jnp.zeros([bsize, self.stoch, self.classes], f32)))
+        stoch=jnp.zeros([bsize, self._stoch_total(), self.classes], f32)))
 
   def truncate(self, entries, carry=None):
     assert entries['deter'].ndim == 3, entries['deter'].shape
@@ -507,14 +293,16 @@ class NOWM(nj.Module):
     deter_prior = deter                              # prior deter: no observation info
     deter = self._spatial_observe(deter, tokens)    # update h_spatial per-location
     deter = self._vec_observe(deter, tokens)        # update h_vec from global pool
-    # obslogit uses prior_deter+tokens (mirrors RSSM): tokens is the ONLY obs-specific
-    # signal, so the model is forced to use it → KL stays non-zero during training.
-    # Using posterior_deter here caused KL collapse (deter already absorbed tokens).
-    x = tokens if self.absolute else jnp.concatenate([deter_prior, tokens], -1)
-    for i in range(self.obslayers):
-      x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
-    logit = self._logit('obslogit', x)
+    # obslogit: per-location (spatial stoch) or global, using prior_deter+tokens.
+    # prior_deter is the ONLY input that differs from prior → stoch must carry obs.
+    if self.stoch_spatial:
+      logit = self._obs_logit_spatial(deter_prior, tokens)
+    else:
+      x = tokens if self.absolute else jnp.concatenate([deter_prior, tokens], -1)
+      for i in range(self.obslayers):
+        x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
+        x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
+      logit = self._logit('obslogit', x)
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
     # carry uses prior_deter: past obs enter only through the stoch bottleneck,
     # forcing the decoder to rely on current stoch → KL stays non-zero.
@@ -644,63 +432,59 @@ class NOWM(nj.Module):
     h_v = deter[:, sp:]                         # (B, D)
     h_s_tok = h_s.reshape(B, H * W, C)          # (B, HW, C) for attention
 
-    # ---- Global → spatial mixing (replaces bidirectional cross-attention) ----
+    # ---- Global → spatial mixing ----
     # h_v broadcasts a summary to all spatial locations so the spatial field
     # knows the global state before running FNO dynamics.
-    # Spatial → global direction is handled by the GRU pool at the end of _core.
     h_v_proj = self.sub('mix_v2s', nn.Linear, C, **self.kw)(h_v)  # (B, C)
     h_s_tok = h_s_tok + h_v_proj[:, None, :]                       # (B, HW, C)
     h_s_tok = self.sub('mix_norm_s', nn.Norm, self.norm)(h_s_tok)
 
     h_s = h_s_tok.reshape(B, H, W, C)
 
-    # ---- FNO-2D: PDE dynamics on h_spatial ----
-    # rfft2 requires float32; cast up, compute, cast back
-    m = min(self.fno_modes, H // 2 + 1, W // 2 + 1)
-    h_f = h_s.astype(jnp.float32)
-    h_fft = jnp.fft.rfft2(h_f, axes=(1, 2))                        # (B,H,W//2+1,C)
-    h_fft_m = h_fft[:, :m, :m, :]                                   # (B,m,m,C)
-    h_ri = jnp.concatenate(
-        [h_fft_m.real, h_fft_m.imag], axis=-1)                      # (B,m,m,2C)
-    h_ri = h_ri.reshape(B, m * m * 2 * C).astype(compute_dtype)
-    h_ri = self.sub('fno_spec', nn.Linear, m * m * 2 * C, **self.kw)(h_ri)
-    h_ri = h_ri.reshape(B, m, m, 2 * C).astype(jnp.float32)
-    h_fft_new = jnp.zeros_like(h_fft).at[:, :m, :m, :].set(
-        h_ri[:, :, :, :C] + 1j * h_ri[:, :, :, C:])
-    h_spec = jnp.fft.irfft2(
-        h_fft_new, s=(H, W), axes=(1, 2)).astype(compute_dtype)     # (B,H,W,C)
-
-    # Local bypass: per-location channel mixing (W path in FNO)
-    h_loc = self.sub('fno_loc', nn.Linear, C, **self.kw)(
-        h_s_tok).reshape(B, H, W, C)
+    # ---- Spatial operator: FNO / Attn / Conv ----
+    h_s_mixed = self._spatial_op(h_s_tok, B, H, W, C, deter.dtype)
 
     # Forcing term: action broadcast to all spatial locations
-    act_f = self.sub('fno_act', nn.Linear, C, **self.kw)(action)
-    act_f = nn.act(self.act)(self.sub('fno_actnorm', nn.Norm, self.norm)(act_f))
+    act_f = self.sub('op_act', nn.Linear, C, **self.kw)(action)
+    act_f = nn.act(self.act)(self.sub('op_actnorm', nn.Norm, self.norm)(act_f))
 
-    # Stochastic term: z broadcast to all spatial locations
-    sto_f = self.sub('fno_sto', nn.Linear, C, **self.kw)(stoch_flat)
-    sto_f = nn.act(self.act)(self.sub('fno_stonorm', nn.Norm, self.norm)(sto_f))
+    # Stochastic forcing: per-location (spatial) or broadcast (global)
+    # Spatial: η(x,t) per location — stochastic PDE noise field
+    # Global:  η(t) broadcast — same noise for every location
+    if self.stoch_spatial:
+      stoch_per_loc = stoch.reshape(B, H * W, self.stoch * self.classes)
+      sto_f = self.sub('op_sto', nn.Linear, C, **self.kw)(stoch_per_loc)  # (B, HW, C)
+      sto_f = nn.act(self.act)(self.sub('op_stonorm', nn.Norm, self.norm)(sto_f))
+    else:
+      sto_f = self.sub('op_sto', nn.Linear, C, **self.kw)(stoch_flat)     # (B, C)
+      sto_f = nn.act(self.act)(self.sub('op_stonorm', nn.Norm, self.norm)(sto_f))
+      sto_f = sto_f[:, None, :]                                            # broadcast
 
-    # Combine: L[u] + W[u] + f(a) + H(z)
-    cand_s_tok = (
-        h_spec + h_loc +
-        act_f[:, None, None, :] + sto_f[:, None, None, :]
-    ).reshape(B, H * W, C)
+    # Add forcings and apply nonlinearity
+    cand_s_tok = h_s_mixed + act_f[:, None, :] + sto_f
     cand_s_tok = nn.act(self.act)(
-        self.sub('fno_candnorm', nn.Norm, self.norm)(cand_s_tok))
+        self.sub('op_candnorm', nn.Norm, self.norm)(cand_s_tok))
 
     # Gated update for h_spatial (GRU-style stability)
     gate_s = jax.nn.sigmoid(
-        self.sub('fno_gate', nn.Linear, C, **self.kw)(
+        self.sub('op_gate', nn.Linear, C, **self.kw)(
             jnp.concatenate([h_s_tok, cand_s_tok], -1)) - 1)
     h_s_new = (
         gate_s * jnp.tanh(cand_s_tok) + (1 - gate_s) * h_s_tok
     ).reshape(B, H, W, C)
 
+    # ---- Spatial → global aggregation ----
+    # Mean + max dual pooling, then project to hidden dim.
+    # This gives h_vec a richer spatial summary (hidden=256) instead of the
+    # raw 16-dim mean pool that was dominated by h_v (512 dims) in the GRU.
+    h_s_tok_new = h_s_new.reshape(B, H * W, C)
+    s2g = jnp.concatenate(
+        [h_s_tok_new.mean(axis=1), h_s_tok_new.max(axis=1)], axis=-1)  # (B, 2C)
+    s2g = self.sub('s2g_proj', nn.Linear, self.hidden, **self.kw)(s2g)
+    s2g = nn.act(self.act)(self.sub('s2g_norm', nn.Norm, self.norm)(s2g))
+
     # ---- GRU update for h_vec ----
-    pool = h_s_new.mean(axis=(1, 2))    # (B, C) global average pool
-    gru_in = jnp.concatenate([h_v, pool, action, stoch_flat], -1)
+    gru_in = jnp.concatenate([h_v, s2g, action, stoch_flat], -1)
     gru_out = self.sub('vec_gru', nn.Linear, 3 * D, **self.kw)(gru_in)
     r, cand_v, upd = jnp.split(gru_out, 3, -1)
     r = jax.nn.sigmoid(r)
@@ -711,16 +495,109 @@ class NOWM(nj.Module):
     return jnp.concatenate([h_s_new.reshape(B, sp), h_v_new], axis=-1)
 
   def _prior(self, feat):
-    x = feat
-    for i in range(self.imglayers):
-      x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
-    return self._logit('priorlogit', x)
+    if self.stoch_spatial:
+      H = W = self.lat_size; C = self.lat_chan; sp = self._sp()
+      h_s_tok = feat[..., :sp].reshape(*feat.shape[:-1], H * W, C)  # (..., HW, C)
+      x = h_s_tok
+      for i in range(self.imglayers):
+        x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
+        x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
+      return self._spatial_logit('priorlogit', x)
+    else:
+      x = feat
+      for i in range(self.imglayers):
+        x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
+        x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
+      return self._logit('priorlogit', x)
 
   def _logit(self, name, x):
     kw = dict(**self.kw, outscale=self.outscale)
     x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x)
     return x.reshape(x.shape[:-1] + (self.stoch, self.classes))
+
+  def _spatial_logit(self, name, x):
+    """Per-location logit: (..., HW, hidden) → (..., HW*stoch, classes)."""
+    kw = dict(**self.kw, outscale=self.outscale)
+    x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x)  # (..., HW, stoch*cls)
+    *lead, HW, _ = x.shape
+    return x.reshape(*lead, HW * self.stoch, self.classes)
+
+  def _obs_logit_spatial(self, deter_prior, tokens):
+    """Spatial posterior: per-location obslogit from (h_s_tok[i,j], enc_tok[i,j])."""
+    H = W = self.lat_size; C = self.lat_chan; sp = self._sp()
+    B = deter_prior.shape[0]
+    h_s_tok = deter_prior[:, :sp].reshape(B, H * W, C)           # (B, HW, C)
+    C_enc = tokens.shape[-1] // (H * W)
+    enc_tok = tokens.reshape(B, H * W, C_enc)                     # (B, HW, C_enc)
+    x = enc_tok if self.absolute else jnp.concatenate(
+        [h_s_tok, enc_tok], axis=-1)                              # (B, HW, C+C_enc)
+    for i in range(self.obslayers):
+      x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
+      x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
+    return self._spatial_logit('obslogit', x)                     # (B, HW*stoch, classes)
+
+
+
+  def _spatial_op(self, h_s_tok, B, H, W, C, compute_dtype):
+    """Dispatch to the selected spatial operator. Returns (B, HW, C)."""
+    if self.spatial_op == 'fno':
+      return self._fno_op(h_s_tok, B, H, W, C, compute_dtype)
+    elif self.spatial_op == 'attn':
+      return self._attn_op(h_s_tok, B, H, W, C)
+    elif self.spatial_op == 'conv':
+      return self._conv_op(h_s_tok, B, H, W, C)
+    else:
+      raise ValueError(f'Unknown spatial_op: {self.spatial_op!r}')
+
+  def _fno_op(self, h_s_tok, B, H, W, C, compute_dtype):
+    """FNO-2D: global spectral mixing (L path) + per-location bypass (W path)."""
+    m = min(self.fno_modes, H // 2 + 1, W // 2 + 1)
+    h_s = h_s_tok.reshape(B, H, W, C)
+    h_f = h_s.astype(jnp.float32)
+    h_fft = jnp.fft.rfft2(h_f, axes=(1, 2))
+    h_fft_m = h_fft[:, :m, :m, :]
+    h_ri = jnp.concatenate([h_fft_m.real, h_fft_m.imag], axis=-1)
+    h_ri = h_ri.reshape(B, m * m * 2 * C).astype(compute_dtype)
+    h_ri = self.sub('fno_spec', nn.Linear, m * m * 2 * C, **self.kw)(h_ri)
+    h_ri = h_ri.reshape(B, m, m, 2 * C).astype(jnp.float32)
+    h_fft_new = jnp.zeros_like(h_fft).at[:, :m, :m, :].set(
+        h_ri[:, :, :, :C] + 1j * h_ri[:, :, :, C:])
+    h_spec = jnp.fft.irfft2(
+        h_fft_new, s=(H, W), axes=(1, 2)).astype(compute_dtype)
+    h_loc = self.sub('fno_loc', nn.Linear, C, **self.kw)(h_s_tok).reshape(B, H, W, C)
+    return (h_spec + h_loc).reshape(B, H * W, C)
+
+  def _attn_op(self, h_s_tok, B, H, W, C):
+    """Multi-head self-attention over spatial tokens.
+
+    No positional encoding: spatial structure is implicit in h_s_tok.
+    Complexity O(HW² × C) — cheap for 8×8 (64 tokens).
+    """
+    heads = self.attn_heads
+    dh = max(1, C // heads)
+    qkv = self.sub('attn_qkv', nn.Linear, 3 * heads * dh, **self.kw)(h_s_tok)
+    q, k, v = jnp.split(qkv, 3, axis=-1)                        # (B, HW, heads*dh)
+    def split_heads(x):
+      return x.reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3)
+    q, k, v = split_heads(q), split_heads(k), split_heads(v)    # (B, heads, HW, dh)
+    attn = jax.nn.softmax(
+        q @ k.transpose(0, 1, 3, 2) * (dh ** -0.5), axis=-1)
+    out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, H * W, heads * dh)
+    return self.sub('attn_proj', nn.Linear, C, **self.kw)(out)   # (B, HW, C)
+
+  def _conv_op(self, h_s_tok, B, H, W, C):
+    """3×3 local convolution via im2col + linear (zero-padded borders).
+
+    Equivalent to a full (non-depthwise) 3×3 conv. Captures local motion
+    patterns (ball/paddle movement between adjacent spatial cells).
+    """
+    h_s = h_s_tok.reshape(B, H, W, C)
+    h_pad = jnp.pad(h_s, ((0, 0), (1, 1), (1, 1), (0, 0)))      # (B, H+2, W+2, C)
+    patches = [h_pad[:, di:di + H, dj:dj + W, :]
+               for di in range(3) for dj in range(3)]             # 9 × (B, H, W, C)
+    h_patches = jnp.concatenate(patches, axis=-1)                 # (B, H, W, 9C)
+    h_patches = h_patches.reshape(B, H * W, 9 * C)
+    return self.sub('conv_proj', nn.Linear, C, **self.kw)(h_patches)  # (B, HW, C)
 
   def _dist(self, logits):
     out = embodied.jax.outs.OneHot(logits, self.unimix)

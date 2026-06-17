@@ -24,10 +24,10 @@ isimage = lambda s: s.dtype == np.uint8 and len(s.shape) == 3
 class Agent(embodied.jax.Agent):
 
   banner = [
-      r"---  ___                           __   ______ ---",
-      r"--- |   \ _ _ ___ __ _ _ __  ___ _ \ \ / /__ / ---",
-      r"--- | |) | '_/ -_) _` | '  \/ -_) '/\ V / |_ \ ---",
-      r"--- |___/|_| \___\__,_|_|_|_\___|_|  \_/ |___/ ---",
+      r"---  _  _  _____      ____  ___   ---",
+      r"--- | \| |/ _ \ \    / /  \/  |  ---",
+      r"--- | .` | (_) \ \/\/ /| |\/| |  ---",
+      r"--- |_|\_|\___/ \_/\_/ |_|  |_|  ---",
   ]
 
   def __init__(self, obs_space, act_space, config):
@@ -42,7 +42,6 @@ class Agent(embodied.jax.Agent):
         'simple': rssm.Encoder,
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
     self.dyn = {
-        'rssm': rssm.RSSM,
         'nowm': rssm.NOWM,
     }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
     self.dec = {
