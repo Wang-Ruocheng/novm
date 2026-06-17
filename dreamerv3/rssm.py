@@ -508,7 +508,8 @@ class NOWM(nj.Module):
     deter = self._core(deter, stoch, action)
     tokens = tokens.reshape((*deter.shape[:-1], -1))
     deter_prior = deter                              # prior deter: no observation info
-    deter = self._spatial_observe(deter, tokens)    # posterior deter: updated from enc
+    deter = self._spatial_observe(deter, tokens)    # update h_spatial per-location
+    deter = self._vec_observe(deter, tokens)        # update h_vec from global pool
     x = tokens if self.absolute else jnp.concatenate([deter, tokens], -1)
     for i in range(self.obslayers):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
@@ -555,6 +556,37 @@ class NOWM(nj.Module):
     h_s_post = gate * jnp.tanh(delta) + (1 - gate) * h_s_tok  # (B, HW, C)
 
     return jnp.concatenate([h_s_post.reshape(B, sp), h_v], axis=-1)
+
+  def _vec_observe(self, deter, tokens):
+    """Global posterior: update h_vec from globally-pooled encoder tokens.
+
+    Encoder spatial tokens are averaged across HW positions, giving a single
+    global feature that captures non-spatial content (score, HUD, etc.).
+    This feeds directly into h_vec so non-spatial info doesn't pollute h_spatial.
+    """
+    sp = self._sp()
+    D = self.deter
+    B = deter.shape[0]
+    H = W = self.lat_size
+
+    h_v = deter[:, sp:]  # (B, D)
+
+    C_enc = tokens.shape[-1] // (H * W)
+    enc_tok = tokens.reshape(B, H * W, C_enc)   # (B, HW, C_enc)
+    enc_global = enc_tok.mean(axis=1)            # (B, C_enc) — global average pool
+
+    x = jnp.concatenate([h_v, enc_global], axis=-1)
+    for i in range(self.obslayers):
+      x = self.sub(f'vec_obs{i}', nn.Linear, self.hidden, **self.kw)(x)
+      x = nn.act(self.act)(self.sub(f'vec_obs{i}norm', nn.Norm, self.norm)(x))
+
+    gate = jax.nn.sigmoid(
+        self.sub('vec_gate', nn.Linear, D, **self.kw)(
+            jnp.concatenate([h_v, x], axis=-1)) - 1)
+    delta = self.sub('vec_proj', nn.Linear, D, **self.kw)(x)
+    h_v_post = gate * jnp.tanh(delta) + (1 - gate) * h_v  # (B, D)
+
+    return jnp.concatenate([deter[:, :sp], h_v_post], axis=-1)
 
   def imagine(self, carry, policy, length, training, single=False):
     if single:
