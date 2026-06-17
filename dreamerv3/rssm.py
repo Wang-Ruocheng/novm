@@ -507,6 +507,7 @@ class NOWM(nj.Module):
     action = nn.mask(action, ~reset)
     deter = self._core(deter, stoch, action)
     tokens = tokens.reshape((*deter.shape[:-1], -1))
+    deter = self._spatial_observe(deter, tokens)
     x = tokens if self.absolute else jnp.concatenate([deter, tokens], -1)
     for i in range(self.obslayers):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
@@ -518,6 +519,38 @@ class NOWM(nj.Module):
     entry = dict(deter=deter, stoch=stoch)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
+
+  def _spatial_observe(self, deter, tokens):
+    """Per-location posterior: update h_spatial[i,j] using enc_spatial[i,j].
+
+    Encoder CNN preserves spatial layout, so enc[i,j] aligns with h_s[i,j].
+    We fuse them per-location with a gated MLP, then write back into deter.
+    """
+    H = W = self.lat_size
+    C = self.lat_chan
+    B = deter.shape[0]
+    sp = self._sp()
+    h_s_tok = deter[:, :sp].reshape(B, H * W, C)
+    h_v = deter[:, sp:]
+
+    # Infer encoder channel dim; works for pure-image envs (atari100k, crafter)
+    C_enc = tokens.shape[-1] // (H * W)
+    enc_tok = tokens.reshape(B, H * W, C_enc)       # (B, HW, C_enc)
+
+    # Per-location fusion
+    x = jnp.concatenate([h_s_tok, enc_tok], axis=-1)  # (B, HW, C+C_enc)
+    for i in range(self.obslayers):
+      x = self.sub(f'spa_obs{i}', nn.Linear, self.hidden, **self.kw)(x)
+      x = nn.act(self.act)(self.sub(f'spa_obs{i}norm', nn.Norm, self.norm)(x))
+
+    # Gated update (bias=-1 → near-identity at init, stable training start)
+    gate = jax.nn.sigmoid(
+        self.sub('spa_gate', nn.Linear, C, **self.kw)(
+            jnp.concatenate([h_s_tok, x], axis=-1)) - 1)
+    delta = self.sub('spa_proj', nn.Linear, C, **self.kw)(x)
+    h_s_post = gate * jnp.tanh(delta) + (1 - gate) * h_s_tok  # (B, HW, C)
+
+    return jnp.concatenate([h_s_post.reshape(B, sp), h_v], axis=-1)
 
   def imagine(self, carry, policy, length, training, single=False):
     if single:
