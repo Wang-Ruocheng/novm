@@ -516,10 +516,10 @@ class NOWM(nj.Module):
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
     logit = self._logit('obslogit', x)
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
-    # carry/entry use posterior_deter so FNO has spatial memory for the next step.
-    # feat['deter'] uses prior_deter so stoch must encode observation for reconstruction,
-    # which keeps KL healthy — identical structure to RSSM.
-    carry = dict(deter=deter, stoch=stoch)
+    # carry uses prior_deter: past obs enter only through the stoch bottleneck,
+    # forcing the decoder to rely on current stoch → KL stays non-zero.
+    # entry keeps posterior_deter so imagination starts from spatially-corrected states.
+    carry = dict(deter=deter_prior, stoch=stoch)
     feat = dict(deter=deter_prior, prior_deter=deter_prior, stoch=stoch, logit=logit)
     entry = dict(deter=deter, stoch=stoch)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
