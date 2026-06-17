@@ -507,7 +507,8 @@ class NOWM(nj.Module):
     action = nn.mask(action, ~reset)
     deter = self._core(deter, stoch, action)
     tokens = tokens.reshape((*deter.shape[:-1], -1))
-    deter = self._spatial_observe(deter, tokens)
+    deter_prior = deter                              # prior deter: no observation info
+    deter = self._spatial_observe(deter, tokens)    # posterior deter: updated from enc
     x = tokens if self.absolute else jnp.concatenate([deter, tokens], -1)
     for i in range(self.obslayers):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
@@ -515,7 +516,7 @@ class NOWM(nj.Module):
     logit = self._logit('obslogit', x)
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
     carry = dict(deter=deter, stoch=stoch)
-    feat = dict(deter=deter, stoch=stoch, logit=logit)
+    feat = dict(deter=deter, prior_deter=deter_prior, stoch=stoch, logit=logit)
     entry = dict(deter=deter, stoch=stoch)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
@@ -534,6 +535,9 @@ class NOWM(nj.Module):
     h_v = deter[:, sp:]
 
     # Infer encoder channel dim; works for pure-image envs (atari100k, crafter)
+    assert tokens.shape[-1] % (H * W) == 0, (
+        f'Token dim {tokens.shape[-1]} not divisible by H*W={H*W}. '
+        f'Check enc.simple.mults and lat_size match.')
     C_enc = tokens.shape[-1] // (H * W)
     enc_tok = tokens.reshape(B, H * W, C_enc)       # (B, HW, C_enc)
 
@@ -578,7 +582,7 @@ class NOWM(nj.Module):
   def loss(self, carry, tokens, acts, reset, training):
     metrics = {}
     carry, entries, feat = self.observe(carry, tokens, acts, reset, training)
-    prior = self._prior(feat['deter'])
+    prior = self._prior(feat['prior_deter'])  # must use prior deter, not posterior
     post = feat['logit']
     dyn = self._dist(sg(post)).kl(self._dist(prior))
     rep = self._dist(post).kl(self._dist(sg(prior)))
