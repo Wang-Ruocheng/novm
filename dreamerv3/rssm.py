@@ -452,9 +452,6 @@ class NOWM(nj.Module):
   # Spatial field h_spatial (lat_size × lat_size × lat_chan)
   lat_size: int = 8
   lat_chan: int = 32
-  # Cross-attention
-  attn_heads: int = 4
-  attn_dim: int = 64
   # FNO-2D: kept Fourier modes per spatial dimension
   fno_modes: int = 4
 
@@ -641,35 +638,13 @@ class NOWM(nj.Module):
     h_v = deter[:, sp:]                         # (B, D)
     h_s_tok = h_s.reshape(B, H * W, C)          # (B, HW, C) for attention
 
-    # ---- Bidirectional cross-attention h_vec <-> h_spatial ----
-    heads = self.attn_heads
-    ad = self.attn_dim
-    hd = ad // heads
-
-    # Direction 1: each spatial token queries h_vec (global → spatial)
-    qs = self.sub('ca_qs', nn.Linear, ad, **self.kw)(h_s_tok)     # (B,HW,ad)
-    kv_v = self.sub('ca_kv', nn.Linear, ad * 2, **self.kw)(h_v)   # (B,2*ad)
-    k_v = kv_v[:, None, :ad].reshape(B, 1, heads, hd).transpose(0, 2, 1, 3)
-    v_v = kv_v[:, None, ad:].reshape(B, 1, heads, hd).transpose(0, 2, 1, 3)
-    qs = qs.reshape(B, H * W, heads, hd).transpose(0, 2, 1, 3)
-    a_sv = jax.nn.softmax(
-        jnp.matmul(qs, k_v.transpose(0, 1, 3, 2)) / math.sqrt(hd), axis=-1)
-    ctx_sv = jnp.matmul(a_sv, v_v).transpose(0, 2, 1, 3).reshape(B, H * W, ad)
-    h_s_tok = h_s_tok + self.sub('ca_proj_s', nn.Linear, C, **self.kw)(ctx_sv)
-    h_s_tok = self.sub('ca_norm_s', nn.Norm, self.norm)(h_s_tok)
-
-    # Direction 2: h_vec queries all spatial tokens (spatial → global)
-    qv = self.sub('ca_qv', nn.Linear, ad, **self.kw)(h_v[:, None, :])  # (B,1,ad)
-    ks = self.sub('ca_ks', nn.Linear, ad, **self.kw)(h_s_tok)           # (B,HW,ad)
-    vs = self.sub('ca_vs', nn.Linear, ad, **self.kw)(h_s_tok)           # (B,HW,ad)
-    qv = qv.reshape(B, 1, heads, hd).transpose(0, 2, 1, 3)
-    ks = ks.reshape(B, H * W, heads, hd).transpose(0, 2, 1, 3)
-    vs = vs.reshape(B, H * W, heads, hd).transpose(0, 2, 1, 3)
-    a_vs = jax.nn.softmax(
-        jnp.matmul(qv, ks.transpose(0, 1, 3, 2)) / math.sqrt(hd), axis=-1)
-    ctx_vs = jnp.matmul(a_vs, vs).transpose(0, 2, 1, 3).reshape(B, ad)
-    h_v = h_v + self.sub('ca_proj_v', nn.Linear, D, **self.kw)(ctx_vs)
-    h_v = self.sub('ca_norm_v', nn.Norm, self.norm)(h_v)
+    # ---- Global → spatial mixing (replaces bidirectional cross-attention) ----
+    # h_v broadcasts a summary to all spatial locations so the spatial field
+    # knows the global state before running FNO dynamics.
+    # Spatial → global direction is handled by the GRU pool at the end of _core.
+    h_v_proj = self.sub('mix_v2s', nn.Linear, C, **self.kw)(h_v)  # (B, C)
+    h_s_tok = h_s_tok + h_v_proj[:, None, :]                       # (B, HW, C)
+    h_s_tok = self.sub('mix_norm_s', nn.Norm, self.norm)(h_s_tok)
 
     h_s = h_s_tok.reshape(B, H, W, C)
 

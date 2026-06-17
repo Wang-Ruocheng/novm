@@ -90,7 +90,7 @@ defaults:
     dyn:
       typ: rssm
       rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0, core: gru, fno_modes: 16}
-      nowm: {deter: 512, hidden: 256, stoch: 32, classes: 32, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, free_nats: 1.0, absolute: False, lat_size: 8, lat_chan: 32, attn_heads: 4, attn_dim: 64, fno_modes: 4}
+      nowm: {deter: 512, hidden: 256, stoch: 32, classes: 32, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, free_nats: 1.0, absolute: False, lat_size: 8, lat_chan: 16, fno_modes: 4}
     enc:
       typ: simple
       simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
@@ -223,8 +223,6 @@ debug:
     .*\.fno_modes: 2
     .*\.lat_size: 4
     .*\.lat_chan: 4
-    .*\.attn_dim: 8
-    .*\.attn_heads: 2
 
 # Neural Operator dynamics presets (append after --configs <env>)
 fno:
