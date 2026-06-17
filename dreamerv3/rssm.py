@@ -564,7 +564,7 @@ class NOWM(nj.Module):
       logit = self._prior(deter)
       stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
       carry = nn.cast(dict(deter=deter, stoch=stoch))
-      feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit))
+      feat = nn.cast(dict(deter=deter, prior_deter=deter, stoch=stoch, logit=logit))
       assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
       return carry, (feat, action)
     else:
