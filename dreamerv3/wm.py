@@ -101,6 +101,14 @@ class Decoder(nj.Module):
   bspace: int = 8
   outer: bool = False
   strided: bool = False
+  # NOWM spatial decode: set spatial_dec=True + lat_size/lat_chan to use
+  # h_spatial as 2D starting feature map instead of flat BlockLinear projection.
+  # Requires lat_size × 2^len(mults) == imgres (e.g. 8 × 2^3 = 64).
+  # Use a dedicated bool so debug's .*\.lat_size regex doesn't accidentally
+  # activate this path in non-NOWM runs.
+  spatial_dec: bool = False
+  lat_size: int = 0
+  lat_chan: int = 0
 
   def __init__(self, obs_space, **kw):
     assert all(len(s.shape) <= 3 for s in obs_space.values()), obs_space
@@ -123,12 +131,12 @@ class Decoder(nj.Module):
     return {}
 
   def __call__(self, carry, feat, reset, training, single=False):
-    assert feat['deter'].shape[-1] % self.bspace == 0
     K = self.kernel
     recons = {}
     bshape = reset.shape
+    BT = math.prod(bshape)
     inp = [nn.cast(feat[k]) for k in ('stoch', 'deter')]
-    inp = [x.reshape((math.prod(bshape), -1)) for x in inp]
+    inp = [x.reshape((BT, -1)) for x in inp]
     inp = jnp.concatenate(inp, -1)
 
     if self.veckeys:
@@ -143,27 +151,53 @@ class Decoder(nj.Module):
       recons.update(outs)
 
     if self.imgkeys:
-      factor = 2 ** (len(self.depths) - int(bool(self.outer)))
-      minres = [int(x // factor) for x in self.imgres]
-      assert 3 <= minres[0] <= 16, minres
-      assert 3 <= minres[1] <= 16, minres
-      shape = (*minres, self.depths[-1])
-      if self.bspace:
-        u, g = math.prod(shape), self.bspace
-        x0, x1 = nn.cast((feat['deter'], feat['stoch']))
-        x0 = x0.reshape((-1, x0.shape[-1]))
-        x1 = x1.reshape((x0.shape[0], -1))
-        x0 = self.sub('sp0', nn.BlockLinear, u, g, **self.kw)(x0)
-        x0 = einops.rearrange(
-            x0, '... (g h w c) -> ... h w (g c)',
-            h=minres[0], w=minres[1], g=g)
-        x1 = self.sub('sp1', nn.Linear, 2 * self.units, **self.kw)(x1)
-        x1 = nn.act(self.act)(self.sub('sp1norm', nn.Norm, self.norm)(x1))
-        x1 = self.sub('sp2', nn.Linear, shape, **self.kw)(x1)
-        x = nn.act(self.act)(self.sub('spnorm', nn.Norm, self.norm)(x0 + x1))
+      if self.spatial_dec:
+        # ── Spatial decode path (NOWM) ──────────────────────────────────────
+        # Starting feature map: concat(h_spatial, stoch_spatial) at 8×8,
+        # conditioned by h_vec via FiLM.  No flat projection, no resolution loss.
+        H = W = self.lat_size; C_lat = self.lat_chan
+        sp = H * W * C_lat
+        assert self.lat_size * (2 ** len(self.depths)) == self.imgres[0], (
+            f'lat_size={self.lat_size} × 2^{len(self.depths)} = '
+            f'{self.lat_size * 2**len(self.depths)} ≠ imgres={self.imgres[0]}. '
+            f'Adjust mults so len(mults) = log2(imgres/lat_size).')
+        d = nn.cast(feat['deter']).reshape(BT, -1)
+        h_s = d[:, :sp].reshape(BT, H, W, C_lat)          # (BT, H, W, lat_chan)
+        h_v = d[:, sp:]                                    # (BT, deter)
+        stoch_s = nn.cast(feat['stoch']).reshape(BT, H, W, -1)  # (BT, H, W, stoch*cls)
+        x = jnp.concatenate([h_s, stoch_s], axis=-1)      # (BT, H, W, lat_chan+stoch*cls)
+        x = self.sub('sp_proj', nn.Linear, self.depths[-1], **self.kw)(x)
+        x = self.sub('sp_projn', nn.Norm, self.norm)(x)
+        # h_vec → FiLM: global state modulates every spatial location
+        film = self.sub('sp_film', nn.Linear, 2 * self.depths[-1], **self.kw)(h_v)
+        γ, β = jnp.split(film, 2, axis=-1)
+        γ = jax.nn.sigmoid(γ) * 2
+        x = nn.act(self.act)(γ[:, None, None, :] * x + β[:, None, None, :])
       else:
-        x = self.sub('space', nn.Linear, shape, **kw)(inp)
-        x = nn.act(self.act)(self.sub('spacenorm', nn.Norm, self.norm)(x))
+        # ── Original bspace path (RSSM / non-spatial) ───────────────────────
+        assert feat['deter'].shape[-1] % self.bspace == 0
+        factor = 2 ** (len(self.depths) - int(bool(self.outer)))
+        minres = [int(r // factor) for r in self.imgres]
+        assert 3 <= minres[0] <= 16, minres
+        assert 3 <= minres[1] <= 16, minres
+        shape = (*minres, self.depths[-1])
+        if self.bspace:
+          u, g = math.prod(shape), self.bspace
+          x0, x1 = nn.cast((feat['deter'], feat['stoch']))
+          x0 = x0.reshape((BT, x0.shape[-1]))
+          x1 = x1.reshape((BT, -1))
+          x0 = self.sub('sp0', nn.BlockLinear, u, g, **self.kw)(x0)
+          x0 = einops.rearrange(
+              x0, '... (g h w c) -> ... h w (g c)',
+              h=minres[0], w=minres[1], g=g)
+          x1 = self.sub('sp1', nn.Linear, 2 * self.units, **self.kw)(x1)
+          x1 = nn.act(self.act)(self.sub('sp1norm', nn.Norm, self.norm)(x1))
+          x1 = self.sub('sp2', nn.Linear, shape, **self.kw)(x1)
+          x = nn.act(self.act)(self.sub('spnorm', nn.Norm, self.norm)(x0 + x1))
+        else:
+          x = self.sub('space', nn.Linear, shape, **self.kw)(inp)
+          x = nn.act(self.act)(self.sub('spacenorm', nn.Norm, self.norm)(x))
+      # ── Shared upsampling ────────────────────────────────────────────────
       for i, depth in reversed(list(enumerate(self.depths[:-1]))):
         if self.strided:
           kw = dict(**self.kw, transp=True)

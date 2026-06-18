@@ -227,6 +227,10 @@ debug:
 nowm:
   agent.dyn.typ: nowm
   agent.enc.simple.mults: [2, 3, 4]
+  agent.dec.simple.mults: [2, 3, 4]
+  agent.dec.simple.spatial_dec: True
+  agent.dec.simple.lat_size: 8
+  agent.dec.simple.lat_chan: 16
   agent.imag_last: 4
   agent.imag_loss.actent: 3e-3
 
