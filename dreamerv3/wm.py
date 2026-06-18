@@ -327,10 +327,14 @@ class NOWM(nj.Module):
     return carry, (entry, feat)
 
   def _spatial_observe(self, deter, tokens):
-    """Per-location posterior: update h_spatial[i,j] using enc_spatial[i,j].
+    """Spatial assimilation: h_spatial updated by obs-conditioned spatial operator.
 
-    Encoder CNN preserves spatial layout, so enc[i,j] aligns with h_s[i,j].
-    We fuse them per-location with a gated MLP, then write back into deter.
+    Mirrors _core's dynamics step, but conditioned on observations instead of action:
+      h_s_post = gated(h_s_prior, O_assim(h_s_prior + enc_inject, ctx_obs))
+
+    Two paths for observation info:
+      1. Per-location additive injection: enc_tok[i,j] added to h_s[i,j] before operator
+      2. Global FiLM conditioning: pooled enc + h_v → ctx_obs conditions operator behavior
     """
     H = W = self.lat_size
     C = self.lat_chan
@@ -339,57 +343,69 @@ class NOWM(nj.Module):
     h_s_tok = deter[:, :sp].reshape(B, H * W, C)
     h_v = deter[:, sp:]
 
-    # Infer encoder channel dim; works for pure-image envs (atari100k, crafter)
     assert tokens.shape[-1] % (H * W) == 0, (
-        f'Token dim {tokens.shape[-1]} not divisible by H*W={H*W}. '
-        f'Check enc.simple.mults and lat_size match.')
+        f'Token dim {tokens.shape[-1]} not divisible by H*W={H*W}.')
     C_enc = tokens.shape[-1] // (H * W)
-    enc_tok = tokens.reshape(B, H * W, C_enc)       # (B, HW, C_enc)
+    enc_tok = tokens.reshape(B, H * W, C_enc)     # (B, HW, C_enc)
 
-    # Per-location fusion
-    x = jnp.concatenate([h_s_tok, enc_tok], axis=-1)  # (B, HW, C+C_enc)
-    for i in range(self.obslayers):
-      x = self.sub(f'spa_obs{i}', nn.Linear, self.hidden, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'spa_obs{i}norm', nn.Norm, self.norm)(x))
+    # Per-location injection: align encoder field with latent field (local detail)
+    h_s_in = h_s_tok + self.sub('assim_enc_inj', nn.Linear, C, **self.kw)(enc_tok)
+    h_s_in = self.sub('assim_in_norm', nn.Norm, self.norm)(h_s_in)
 
-    # Gated update (bias=-1 → near-identity at init, stable training start)
+    # Observation context: global enc summary + h_v → conditions assimilation operator
+    enc_global = enc_tok.mean(axis=1)              # (B, C_enc) — global summary
+    obs_ctx = nn.act(self.act)(
+        self.sub('assim_ctx_norm', nn.Norm, self.norm)(
+            self.sub('assim_ctx', nn.Linear, C, **self.kw)(
+                jnp.concatenate([enc_global, h_v], axis=-1))))  # (B, C)
+
+    # Assimilation operator: same structure as dynamics, independent weights
+    h_s_cand = self._spatial_op(h_s_in, B, H, W, C, deter.dtype, obs_ctx, prefix='assim')
+
+    # Gated update (bias=-1 → near-identity at init)
     gate = jax.nn.sigmoid(
-        self.sub('spa_gate', nn.Linear, C, **self.kw)(
-            jnp.concatenate([h_s_tok, x], axis=-1)) - 1)
-    delta = self.sub('spa_proj', nn.Linear, C, **self.kw)(x)
-    h_s_post = gate * jnp.tanh(delta) + (1 - gate) * h_s_tok  # (B, HW, C)
+        self.sub('assim_gate', nn.Linear, C, **self.kw)(
+            jnp.concatenate([h_s_tok, h_s_cand], axis=-1)) - 1)
+    h_s_post = (gate * jnp.tanh(h_s_cand) + (1 - gate) * h_s_tok).reshape(B, sp)
 
-    return jnp.concatenate([h_s_post.reshape(B, sp), h_v], axis=-1)
+    return jnp.concatenate([h_s_post, h_v], axis=-1)
 
   def _vec_observe(self, deter, tokens):
-    """Global posterior: update h_vec from globally-pooled encoder tokens.
+    """Global assimilation: h_vec updated via GRU conditioned on attended encoder tokens.
 
-    Encoder spatial tokens are averaged across HW positions, giving a single
-    global feature that captures non-spatial content (score, HUD, etc.).
-    This feeds directly into h_vec so non-spatial info doesn't pollute h_spatial.
+    Symmetric with _core's h_v GRU update:
+      _core:  GRU(h_v, s2g + action + stoch)  — dynamics driven by spatial readout
+      here:   GRU(h_v, enc_attended)           — assimilation driven by encoder readout
+
+    h_vec queries encoder tokens via attention first (selects relevant spatial regions),
+    then the attended summary drives a GRU update of h_v.
     """
     sp = self._sp()
     D = self.deter
     B = deter.shape[0]
     H = W = self.lat_size
 
-    h_v = deter[:, sp:]  # (B, D)
+    h_v = deter[:, sp:]
 
     C_enc = tokens.shape[-1] // (H * W)
     enc_tok = tokens.reshape(B, H * W, C_enc)   # (B, HW, C_enc)
-    enc_global = jnp.concatenate(
-        [enc_tok.mean(axis=1), enc_tok.max(axis=1)], axis=-1)  # (B, 2*C_enc)
 
-    x = jnp.concatenate([h_v, enc_global], axis=-1)
-    for i in range(self.obslayers):
-      x = self.sub(f'vec_obs{i}', nn.Linear, self.hidden, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'vec_obs{i}norm', nn.Norm, self.norm)(x))
+    # h_vec-conditioned attention: select relevant spatial regions from encoder
+    q_vo = self.sub('vobs_q', nn.Linear, C_enc, **self.kw)(h_v)         # (B, C_enc)
+    k_vo = self.sub('vobs_k', nn.Linear, C_enc, **self.kw)(enc_tok)     # (B, HW, C_enc)
+    v_vo = self.sub('vobs_v', nn.Linear, C_enc, **self.kw)(enc_tok)     # (B, HW, C_enc)
+    attn_vo = jax.nn.softmax(
+        jnp.einsum('bc,bnc->bn', q_vo, k_vo) * (C_enc ** -0.5), axis=-1)
+    enc_attended = jnp.einsum('bn,bnc->bc', attn_vo, v_vo)              # (B, C_enc)
 
-    gate = jax.nn.sigmoid(
-        self.sub('vec_gate', nn.Linear, D, **self.kw)(
-            jnp.concatenate([h_v, x], axis=-1)) - 1)
-    delta = self.sub('vec_proj', nn.Linear, D, **self.kw)(x)
-    h_v_post = gate * jnp.tanh(delta) + (1 - gate) * h_v  # (B, D)
+    # GRU update (mirrors _core's h_v GRU, driven by enc_attended instead of s2g+action)
+    gru_in = jnp.concatenate([h_v, enc_attended], axis=-1)
+    gru_out = self.sub('vobs_gru', nn.Linear, 3 * D, **self.kw)(gru_in)
+    r, cand_v, upd = jnp.split(gru_out, 3, axis=-1)
+    r = jax.nn.sigmoid(r)
+    cand_v = jnp.tanh(r * cand_v)
+    upd = jax.nn.sigmoid(upd - 1)
+    h_v_post = upd * cand_v + (1 - upd) * h_v                          # (B, D)
 
     return jnp.concatenate([deter[:, :sp], h_v_post], axis=-1)
 
@@ -442,7 +458,6 @@ class NOWM(nj.Module):
     D = self.deter
     B = deter.shape[0]
     sp = self._sp()
-    compute_dtype = deter.dtype
     stoch_flat = stoch.reshape(B, -1)
     action = action / sg(jnp.maximum(1, jnp.abs(action)))
 
@@ -451,20 +466,17 @@ class NOWM(nj.Module):
     h_v = deter[:, sp:]                         # (B, D)
     h_s_tok = h_s.reshape(B, H * W, C)          # (B, HW, C) for attention
 
-    # ---- Global → spatial mixing ----
-    # h_v broadcasts a summary to all spatial locations so the spatial field
-    # knows the global state before running FNO dynamics.
-    h_v_proj = self.sub('mix_v2s', nn.Linear, C, **self.kw)(h_v)  # (B, C)
-    h_s_tok = h_s_tok + h_v_proj[:, None, :]                       # (B, HW, C)
+    # ---- Context embedding: action + global state ----
+    # Both action and h_vec condition the spatial operator INSIDE WNO (per-subband FiLM).
+    # Combining them here keeps the operator interface clean.
+    act_emb = self.sub('op_act', nn.Linear, C, **self.kw)(action)      # (B, C)
+    h_v_emb = self.sub('op_hv',  nn.Linear, C, **self.kw)(h_v)         # (B, C)
+    ctx = nn.act(self.act)(
+        self.sub('op_ctx_norm', nn.Norm, self.norm)(act_emb + h_v_emb))  # (B, C)
     h_s_tok = self.sub('mix_norm_s', nn.Norm, self.norm)(h_s_tok)
 
-    # Action embedding — conditions the spatial operator via per-subband FiLM
-    # For WNO: FiLM inside each wavelet subband (action drives the operator itself)
-    # For fno/attn/conv: additive forcing fallback
-    act_emb = self.sub('op_act', nn.Linear, C, **self.kw)(action)  # (B, C)
-
-    # ---- Spatial operator: FNO / Attn / Conv / WNO (action-conditioned) ----
-    h_s_mixed = self._spatial_op(h_s_tok, B, H, W, C, deter.dtype, act_emb)
+    # ---- Spatial operator: conditioned on ctx inside WNO subbands ----
+    h_s_mixed = self._spatial_op(h_s_tok, B, H, W, C, deter.dtype, ctx)
 
     # Stochastic forcing: per-location (spatial) or broadcast (global)
     # Spatial: η(x,t) per location — stochastic PDE noise field
@@ -491,18 +503,27 @@ class NOWM(nj.Module):
         gate_s * jnp.tanh(cand_s_tok) + (1 - gate_s) * h_s_tok
     ).reshape(B, H, W, C)
 
-    # ---- Spatial → global aggregation ----
-    # Mean + max dual pooling, then project to hidden dim.
-    # This gives h_vec a richer spatial summary (hidden=256) instead of the
-    # raw 16-dim mean pool that was dominated by h_v (512 dims) in the GRU.
+    # ---- Spatial → global: h_vec-conditioned attention pooling ----
+    # h_vec acts as query: it actively selects which spatial locations are relevant
+    # (e.g. "health low" → attend to nearby hazards), rather than blind mean+max.
     h_s_tok_new = h_s_new.reshape(B, H * W, C)
-    s2g = jnp.concatenate(
-        [h_s_tok_new.mean(axis=1), h_s_tok_new.max(axis=1)], axis=-1)  # (B, 2C)
+    q_s2g = self.sub('s2g_q', nn.Linear, C, **self.kw)(h_v)          # (B, C)
+    k_s2g = self.sub('s2g_k', nn.Linear, C, **self.kw)(h_s_tok_new)  # (B, HW, C)
+    v_s2g = self.sub('s2g_v', nn.Linear, C, **self.kw)(h_s_tok_new)  # (B, HW, C)
+    attn_s2g = jax.nn.softmax(
+        jnp.einsum('bc,bnc->bn', q_s2g, k_s2g) * (C ** -0.5), axis=-1)  # (B, HW)
+    s2g = jnp.einsum('bn,bnc->bc', attn_s2g, v_s2g)                  # (B, C)
     s2g = self.sub('s2g_proj', nn.Linear, self.hidden, **self.kw)(s2g)
     s2g = nn.act(self.act)(self.sub('s2g_norm', nn.Norm, self.norm)(s2g))
 
     # ---- GRU update for h_vec ----
-    gru_in = jnp.concatenate([h_v, s2g, action, stoch_flat], -1)
+    # Spatial stoch is (B, H*W*stoch*classes): project to hidden before concat
+    if self.stoch_spatial:
+      stoch_gru = self.sub('stoch_enc', nn.Linear, self.hidden, **self.kw)(stoch_flat)
+      stoch_gru = nn.act(self.act)(self.sub('stoch_enc_norm', nn.Norm, self.norm)(stoch_gru))
+    else:
+      stoch_gru = stoch_flat
+    gru_in = jnp.concatenate([h_v, s2g, action, stoch_gru], -1)
     gru_out = self.sub('vec_gru', nn.Linear, 3 * D, **self.kw)(gru_in)
     r, cand_v, upd = jnp.split(gru_out, 3, -1)
     r = jax.nn.sigmoid(r)
@@ -517,12 +538,18 @@ class NOWM(nj.Module):
       H = W = self.lat_size; C = self.lat_chan; sp = self._sp()
       h_s_tok = feat[..., :sp].reshape(*feat.shape[:-1], H * W, C)  # (..., HW, C)
       h_v = feat[..., sp:]                                           # (..., D)
-      h_v_proj = self.sub('prior_v2s', nn.Linear, C, **self.kw)(h_v)  # (..., C)
-      h_s_tok = h_s_tok + h_v_proj[..., None, :]                    # (..., HW, C)
+      # h_vec → ctx for FiLM conditioning (mirrors WNO per-subband conditioning)
+      ctx_p = nn.act(self.act)(
+          self.sub('prior_ctx_norm', nn.Norm, self.norm)(
+              self.sub('prior_ctx', nn.Linear, C, **self.kw)(h_v)))   # (..., C)
       x = h_s_tok
       for i in range(self.imglayers):
-        x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
-        x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
+        x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)   # (..., HW, hidden)
+        x = self.sub(f'prior{i}norm', nn.Norm, self.norm)(x)              # norm first
+        film = self.sub(f'prior{i}_film', nn.Linear, 2 * self.hidden, **self.kw)(ctx_p)
+        γ, β = jnp.split(film, 2, axis=-1)
+        γ = jax.nn.sigmoid(γ) * 2
+        x = nn.act(self.act)(γ[..., None, :] * x + β[..., None, :])      # FiLM then act
       return self._spatial_logit('priorlogit', x)
     else:
       x = feat
@@ -530,6 +557,7 @@ class NOWM(nj.Module):
         x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
         x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
       return self._logit('priorlogit', x)
+
   def _logit(self, name, x):
     kw = dict(**self.kw, outscale=self.outscale)
     x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x)
@@ -564,20 +592,24 @@ class NOWM(nj.Module):
 
 
 
-  def _spatial_op(self, h_s_tok, B, H, W, C, compute_dtype, act_emb):
-    """Dispatch to the selected spatial operator. Returns (B, HW, C)."""
+  def _spatial_op(self, h_s_tok, B, H, W, C, compute_dtype, ctx, prefix='dyn'):
+    """Dispatch to the selected spatial operator. Returns (B, HW, C).
+
+    prefix distinguishes dynamics weights ('dyn') from assimilation weights ('assim'),
+    allowing the same operator structure to be reused with independent parameters.
+    """
     if self.spatial_op == 'fno':
-      return self._fno_op(h_s_tok, B, H, W, C, compute_dtype) + act_emb[:, None, :]
+      return self._fno_op(h_s_tok, B, H, W, C, compute_dtype, prefix) + ctx[:, None, :]
     elif self.spatial_op == 'attn':
-      return self._attn_op(h_s_tok, B, H, W, C) + act_emb[:, None, :]
+      return self._attn_op(h_s_tok, B, H, W, C, prefix) + ctx[:, None, :]
     elif self.spatial_op == 'conv':
-      return self._conv_op(h_s_tok, B, H, W, C) + act_emb[:, None, :]
+      return self._conv_op(h_s_tok, B, H, W, C, prefix) + ctx[:, None, :]
     elif self.spatial_op == 'wno':
-      return self._wno_op(h_s_tok, B, H, W, C, act_emb)
+      return self._wno_op(h_s_tok, B, H, W, C, ctx, prefix)
     else:
       raise ValueError(f'Unknown spatial_op: {self.spatial_op!r}')
 
-  def _fno_op(self, h_s_tok, B, H, W, C, compute_dtype):
+  def _fno_op(self, h_s_tok, B, H, W, C, compute_dtype, prefix='dyn'):
     """FNO-2D: per-mode spectral channel mixing + per-location bypass.
 
     Fix vs naive impl: keep (B, m, m, 2C) shape so each Fourier mode gets its
@@ -590,25 +622,22 @@ class NOWM(nj.Module):
     h_fft_m = h_fft[:, :m, :m, :]                               # (B, m, m, C)
     h_ri = jnp.concatenate([h_fft_m.real, h_fft_m.imag], -1)   # (B, m, m, 2C)
     # Per-mode channel mixing (shared weight): proper FNO spectral operator
-    h_ri = self.sub('fno_spec', nn.Linear, 2 * C, **self.kw)(
+    h_ri = self.sub(f'{prefix}_spec', nn.Linear, 2 * C, **self.kw)(
         h_ri.astype(compute_dtype))                              # (B, m, m, 2C)
     h_ri = h_ri.astype(jnp.float32)
     h_fft_new = jnp.zeros_like(h_fft).at[:, :m, :m, :].set(
         h_ri[..., :C] + 1j * h_ri[..., C:])
     h_spec = jnp.fft.irfft2(
         h_fft_new, s=(H, W), axes=(1, 2)).astype(compute_dtype)
-    h_loc = self.sub('fno_loc', nn.Linear, C, **self.kw)(h_s_tok).reshape(B, H, W, C)
+    h_loc = self.sub(f'{prefix}_loc', nn.Linear, C, **self.kw)(h_s_tok).reshape(B, H, W, C)
     return (h_spec + h_loc).reshape(B, H * W, C)
 
-  def _wno_op(self, h_s_tok, B, H, W, C, act_emb):
-    """Wavelet Neural Operator with action-conditioned per-subband FiLM.
+  def _wno_op(self, h_s_tok, B, H, W, C, ctx, prefix='dyn'):
+    """Wavelet Neural Operator conditioned on context (action + global state).
 
-    Haar DWT is compact-support (local) unlike Fourier, so it naturally
-    represents localized objects (ball, paddle) at multiple scales.
-    2-level decomposition on 8×8: level-1 subbands at 4×4, level-2 at 2×2.
-    Per-subband: Linear(C,C) → FiLM(act_emb) → norm + act — 7 blocks.
-    Action conditions the wavelet channel mixing directly (operator-level driving).
-    Bypass path (like FNO h_loc) preserves pointwise features.
+    ctx = f(action, h_vec) conditions each subband's channel mixing via FiLM,
+    so the operator's behavior adapts to both what action is taken AND the
+    current global state (score, health, etc.).
     """
     compute_dtype = h_s_tok.dtype
     h = h_s_tok.reshape(B, H, W, C)
@@ -635,12 +664,12 @@ class NOWM(nj.Module):
       return jnp.stack([lo + hi, lo - hi], axis=2).reshape(B, h_out, w_out, C)
 
     def mix(name, x):
-      h = self.sub(name, nn.Linear, C, **self.kw)(x)
-      film = self.sub(name + '_act', nn.Linear, 2 * C, **self.kw)(act_emb)  # (B, 2C)
-      γ, β = jnp.split(film, 2, axis=-1)                                    # (B, C) each
-      γ = jax.nn.sigmoid(γ) * 2                                             # ∈[0,2], ≈1 at init
-      h = γ[:, None, None, :] * h + β[:, None, None, :]
-      return nn.act(self.act)(self.sub(name + 'n', nn.Norm, self.norm)(h))
+      h = self.sub(f'{prefix}_{name}', nn.Linear, C, **self.kw)(x)
+      h = self.sub(f'{prefix}_{name}n', nn.Norm, self.norm)(h)          # norm first
+      film = self.sub(f'{prefix}_{name}_act', nn.Linear, 2 * C, **self.kw)(ctx)  # (B, 2C)
+      γ, β = jnp.split(film, 2, axis=-1)
+      γ = jax.nn.sigmoid(γ) * 2
+      return nn.act(self.act)(γ[:, None, None, :] * h + β[:, None, None, :])
 
     # Level-1 decomposition
     ll1, lh1, hl1, hh1 = haar_fwd(h)
@@ -648,23 +677,23 @@ class NOWM(nj.Module):
     ll2, lh2, hl2, hh2 = haar_fwd(ll1)
 
     # Per-subband learnable channel mixing + norm + act
-    ll2 = mix('wno_ll2', ll2)
-    lh2 = mix('wno_lh2', lh2)
-    hl2 = mix('wno_hl2', hl2)
-    hh2 = mix('wno_hh2', hh2)
-    lh1 = mix('wno_lh1', lh1)
-    hl1 = mix('wno_hl1', hl1)
-    hh1 = mix('wno_hh1', hh1)
+    ll2 = mix('ll2', ll2)
+    lh2 = mix('lh2', lh2)
+    hl2 = mix('hl2', hl2)
+    hh2 = mix('hh2', hh2)
+    lh1 = mix('lh1', lh1)
+    hl1 = mix('hl1', hl1)
+    hh1 = mix('hh1', hh1)
 
     # Reconstruct level-2 → level-1 LL → full resolution
     ll1_rec = haar_inv(ll2, lh2, hl2, hh2, H // 2, W // 2)
     h_wno   = haar_inv(ll1_rec, lh1, hl1, hh1, H, W)
 
     # Bypass path: per-location linear (like FNO's h_loc), preserves pointwise features
-    h_bypass = self.sub('wno_loc', nn.Linear, C, **self.kw)(h_s_tok).reshape(B, H, W, C)
+    h_bypass = self.sub(f'{prefix}_loc', nn.Linear, C, **self.kw)(h_s_tok).reshape(B, H, W, C)
     return (h_wno + h_bypass).reshape(B, H * W, C)
 
-  def _attn_op(self, h_s_tok, B, H, W, C):
+  def _attn_op(self, h_s_tok, B, H, W, C, prefix='dyn'):
     """Multi-head self-attention over spatial tokens with pre-norm and residual.
 
     Pre-LN + residual matches standard transformer practice and stabilises
@@ -673,8 +702,8 @@ class NOWM(nj.Module):
     """
     heads = self.attn_heads
     dh = max(1, C // heads)
-    x = self.sub('attn_norm', nn.Norm, self.norm)(h_s_tok)         # pre-norm
-    qkv = self.sub('attn_qkv', nn.Linear, 3 * heads * dh, **self.kw)(x)
+    x = self.sub(f'{prefix}_norm', nn.Norm, self.norm)(h_s_tok)         # pre-norm
+    qkv = self.sub(f'{prefix}_qkv', nn.Linear, 3 * heads * dh, **self.kw)(x)
     q, k, v = jnp.split(qkv, 3, axis=-1)                          # (B, HW, heads*dh)
     def split_heads(x):
       return x.reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3)
@@ -682,10 +711,10 @@ class NOWM(nj.Module):
     attn = jax.nn.softmax(
         q @ k.transpose(0, 1, 3, 2) * (dh ** -0.5), axis=-1)
     out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, H * W, heads * dh)
-    out = self.sub('attn_proj', nn.Linear, C, **self.kw)(out)
+    out = self.sub(f'{prefix}_proj', nn.Linear, C, **self.kw)(out)
     return h_s_tok + out                                            # residual
 
-  def _conv_op(self, h_s_tok, B, H, W, C):
+  def _conv_op(self, h_s_tok, B, H, W, C, prefix='dyn'):
     """3×3 local convolution via im2col + linear (zero-padded borders).
 
     Equivalent to a full (non-depthwise) 3×3 conv. Captures local motion
@@ -697,7 +726,7 @@ class NOWM(nj.Module):
                for di in range(3) for dj in range(3)]             # 9 × (B, H, W, C)
     h_patches = jnp.concatenate(patches, axis=-1)                 # (B, H, W, 9C)
     h_patches = h_patches.reshape(B, H * W, 9 * C)
-    return self.sub('conv_proj', nn.Linear, C, **self.kw)(h_patches)  # (B, HW, C)
+    return self.sub(f'{prefix}_proj', nn.Linear, C, **self.kw)(h_patches)  # (B, HW, C)
 
   def _dist(self, logits):
     if logits.ndim >= 5:  # spatial: (..., H, W, stoch, classes)
