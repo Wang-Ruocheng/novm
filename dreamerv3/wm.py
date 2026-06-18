@@ -442,15 +442,13 @@ class NOWM(nj.Module):
     h_s_tok = h_s_tok + h_v_proj[:, None, :]                       # (B, HW, C)
     h_s_tok = self.sub('mix_norm_s', nn.Norm, self.norm)(h_s_tok)
 
-    # ---- Spatial operator: FNO / Attn / Conv / WNO ----
-    h_s_mixed = self._spatial_op(h_s_tok, B, H, W, C, deter.dtype)
+    # Action embedding — conditions the spatial operator via per-subband FiLM
+    # For WNO: FiLM inside each wavelet subband (action drives the operator itself)
+    # For fno/attn/conv: additive forcing fallback
+    act_emb = self.sub('op_act', nn.Linear, C, **self.kw)(action)  # (B, C)
 
-    # Action operator: FiLM (Feature-wise Linear Modulation)
-    # O_act(h) = γ_a ⊙ h + β_a  — multiplicative + additive, uniform across space
-    # γ ∈ [0,2] via sigmoid*2, initialized ~1 (identity-like at start)
-    act_film = self.sub('op_act', nn.Linear, 2 * C, **self.kw)(action)  # (B, 2C)
-    act_γ, act_β = jnp.split(act_film, 2, axis=-1)                      # (B, C) each
-    act_γ = jax.nn.sigmoid(act_γ) * 2                                   # [0, 2]
+    # ---- Spatial operator: FNO / Attn / Conv / WNO (action-conditioned) ----
+    h_s_mixed = self._spatial_op(h_s_tok, B, H, W, C, deter.dtype, act_emb)
 
     # Stochastic forcing: per-location (spatial) or broadcast (global)
     # Spatial: η(x,t) per location — stochastic PDE noise field
@@ -464,8 +462,8 @@ class NOWM(nj.Module):
       sto_f = nn.act(self.act)(self.sub('op_stonorm', nn.Norm, self.norm)(sto_f))
       sto_f = sto_f[:, None, :]                                            # broadcast
 
-    # Apply action operator then add stochastic forcing
-    cand_s_tok = act_γ[:, None, :] * h_s_mixed + act_β[:, None, :] + sto_f
+    # O_env(action-conditioned) + F_stoch
+    cand_s_tok = h_s_mixed + sto_f
     cand_s_tok = nn.act(self.act)(
         self.sub('op_candnorm', nn.Norm, self.norm)(cand_s_tok))
 
@@ -549,16 +547,16 @@ class NOWM(nj.Module):
 
 
 
-  def _spatial_op(self, h_s_tok, B, H, W, C, compute_dtype):
+  def _spatial_op(self, h_s_tok, B, H, W, C, compute_dtype, act_emb):
     """Dispatch to the selected spatial operator. Returns (B, HW, C)."""
     if self.spatial_op == 'fno':
-      return self._fno_op(h_s_tok, B, H, W, C, compute_dtype)
+      return self._fno_op(h_s_tok, B, H, W, C, compute_dtype) + act_emb[:, None, :]
     elif self.spatial_op == 'attn':
-      return self._attn_op(h_s_tok, B, H, W, C)
+      return self._attn_op(h_s_tok, B, H, W, C) + act_emb[:, None, :]
     elif self.spatial_op == 'conv':
-      return self._conv_op(h_s_tok, B, H, W, C)
+      return self._conv_op(h_s_tok, B, H, W, C) + act_emb[:, None, :]
     elif self.spatial_op == 'wno':
-      return self._wno_op(h_s_tok, B, H, W, C)
+      return self._wno_op(h_s_tok, B, H, W, C, act_emb)
     else:
       raise ValueError(f'Unknown spatial_op: {self.spatial_op!r}')
 
@@ -585,13 +583,14 @@ class NOWM(nj.Module):
     h_loc = self.sub('fno_loc', nn.Linear, C, **self.kw)(h_s_tok).reshape(B, H, W, C)
     return (h_spec + h_loc).reshape(B, H * W, C)
 
-  def _wno_op(self, h_s_tok, B, H, W, C):
-    """Wavelet Neural Operator: 2-level Haar DWT + per-subband channel mixing.
+  def _wno_op(self, h_s_tok, B, H, W, C, act_emb):
+    """Wavelet Neural Operator with action-conditioned per-subband FiLM.
 
     Haar DWT is compact-support (local) unlike Fourier, so it naturally
     represents localized objects (ball, paddle) at multiple scales.
     2-level decomposition on 8×8: level-1 subbands at 4×4, level-2 at 2×2.
-    Per-subband: Linear(C,C) + norm + act — 7 blocks, ~1.8K params.
+    Per-subband: Linear(C,C) → FiLM(act_emb) → norm + act — 7 blocks.
+    Action conditions the wavelet channel mixing directly (operator-level driving).
     Bypass path (like FNO h_loc) preserves pointwise features.
     """
     compute_dtype = h_s_tok.dtype
@@ -619,8 +618,12 @@ class NOWM(nj.Module):
       return jnp.stack([lo + hi, lo - hi], axis=2).reshape(B, h_out, w_out, C)
 
     def mix(name, x):
-      x = self.sub(name, nn.Linear, C, **self.kw)(x)
-      return nn.act(self.act)(self.sub(name + 'n', nn.Norm, self.norm)(x))
+      h = self.sub(name, nn.Linear, C, **self.kw)(x)
+      film = self.sub(name + '_act', nn.Linear, 2 * C, **self.kw)(act_emb)  # (B, 2C)
+      γ, β = jnp.split(film, 2, axis=-1)                                    # (B, C) each
+      γ = jax.nn.sigmoid(γ) * 2                                             # ∈[0,2], ≈1 at init
+      h = γ[:, None, None, :] * h + β[:, None, None, :]
+      return nn.act(self.act)(self.sub(name + 'n', nn.Norm, self.norm)(h))
 
     # Level-1 decomposition
     ll1, lh1, hl1, hh1 = haar_fwd(h)
