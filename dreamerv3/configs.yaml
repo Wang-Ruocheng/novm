@@ -229,3 +229,8 @@ nowm:
   agent.enc.simple.mults: [2, 3, 4]
   agent.imag_last: 4
   agent.imag_loss.actent: 3e-4
+
+multi2gpu:
+  jax.policy_devices: [0]
+  jax.train_devices: [0, 1]
+  batch_size: 32
