@@ -364,7 +364,8 @@ class NOWM(nj.Module):
 
     C_enc = tokens.shape[-1] // (H * W)
     enc_tok = tokens.reshape(B, H * W, C_enc)   # (B, HW, C_enc)
-    enc_global = enc_tok.mean(axis=1)            # (B, C_enc) — global average pool
+    enc_global = jnp.concatenate(
+        [enc_tok.mean(axis=1), enc_tok.max(axis=1)], axis=-1)  # (B, 2*C_enc)
 
     x = jnp.concatenate([h_v, enc_global], axis=-1)
     for i in range(self.obslayers):
@@ -546,44 +547,110 @@ class NOWM(nj.Module):
       return self._attn_op(h_s_tok, B, H, W, C)
     elif self.spatial_op == 'conv':
       return self._conv_op(h_s_tok, B, H, W, C)
+    elif self.spatial_op == 'wno':
+      return self._wno_op(h_s_tok, B, H, W, C)
     else:
       raise ValueError(f'Unknown spatial_op: {self.spatial_op!r}')
 
   def _fno_op(self, h_s_tok, B, H, W, C, compute_dtype):
-    """FNO-2D: global spectral mixing (L path) + per-location bypass (W path)."""
+    """FNO-2D: per-mode spectral channel mixing + per-location bypass.
+
+    Fix vs naive impl: keep (B, m, m, 2C) shape so each Fourier mode gets its
+    own channel mixing instead of a single flat transform over all modes at once.
+    Parameters: Linear(2C, 2C) ≈ 1K vs flat Linear(m²·2C, m²·2C) ≈ 262K.
+    """
     m = min(self.fno_modes, H // 2 + 1, W // 2 + 1)
     h_s = h_s_tok.reshape(B, H, W, C)
-    h_f = h_s.astype(jnp.float32)
-    h_fft = jnp.fft.rfft2(h_f, axes=(1, 2))
-    h_fft_m = h_fft[:, :m, :m, :]
-    h_ri = jnp.concatenate([h_fft_m.real, h_fft_m.imag], axis=-1)
-    h_ri = h_ri.reshape(B, m * m * 2 * C).astype(compute_dtype)
-    h_ri = self.sub('fno_spec', nn.Linear, m * m * 2 * C, **self.kw)(h_ri)
-    h_ri = h_ri.reshape(B, m, m, 2 * C).astype(jnp.float32)
+    h_fft = jnp.fft.rfft2(h_s.astype(jnp.float32), axes=(1, 2))
+    h_fft_m = h_fft[:, :m, :m, :]                               # (B, m, m, C)
+    h_ri = jnp.concatenate([h_fft_m.real, h_fft_m.imag], -1)   # (B, m, m, 2C)
+    # Per-mode channel mixing (shared weight): proper FNO spectral operator
+    h_ri = self.sub('fno_spec', nn.Linear, 2 * C, **self.kw)(
+        h_ri.astype(compute_dtype))                              # (B, m, m, 2C)
+    h_ri = h_ri.astype(jnp.float32)
     h_fft_new = jnp.zeros_like(h_fft).at[:, :m, :m, :].set(
-        h_ri[:, :, :, :C] + 1j * h_ri[:, :, :, C:])
+        h_ri[..., :C] + 1j * h_ri[..., C:])
     h_spec = jnp.fft.irfft2(
         h_fft_new, s=(H, W), axes=(1, 2)).astype(compute_dtype)
     h_loc = self.sub('fno_loc', nn.Linear, C, **self.kw)(h_s_tok).reshape(B, H, W, C)
     return (h_spec + h_loc).reshape(B, H * W, C)
 
-  def _attn_op(self, h_s_tok, B, H, W, C):
-    """Multi-head self-attention over spatial tokens.
+  def _wno_op(self, h_s_tok, B, H, W, C):
+    """Wavelet Neural Operator: 2-level Haar DWT + per-subband channel mixing.
 
-    No positional encoding: spatial structure is implicit in h_s_tok.
+    Haar DWT is compact-support (local) unlike Fourier, so it naturally
+    represents localized objects (ball, paddle) at multiple scales.
+    2-level decomposition on 8×8: level-1 subbands at 4×4, level-2 at 2×2.
+    Per-subband: Linear(C,C) + norm + act — 7 blocks, ~1.8K params.
+    Bypass path (like FNO h_loc) preserves pointwise features.
+    """
+    h = h_s_tok.reshape(B, H, W, C)
+
+    def haar_fwd(x):
+      """Single-level 2D Haar forward: (B,h,w,C) → (ll,lh,hl,hh) each (B,h/2,w/2,C)."""
+      a, b = x[:, ::2], x[:, 1::2]
+      lo = (a + b) * 0.5
+      hi = (a - b) * 0.5
+      ll = (lo[:, :, ::2] + lo[:, :, 1::2]) * 0.5
+      lh = (lo[:, :, ::2] - lo[:, :, 1::2]) * 0.5
+      hl = (hi[:, :, ::2] + hi[:, :, 1::2]) * 0.5
+      hh = (hi[:, :, ::2] - hi[:, :, 1::2]) * 0.5
+      return ll, lh, hl, hh
+
+    def haar_inv(ll, lh, hl, hh, h_out, w_out):
+      """Single-level 2D Haar inverse via stack+reshape (exact reconstruction)."""
+      # Inverse on cols: even cols = ll+lh, odd cols = ll-lh
+      lo = jnp.stack([ll + lh, ll - lh], axis=3).reshape(B, h_out // 2, w_out, C)
+      hi = jnp.stack([hl + hh, hl - hh], axis=3).reshape(B, h_out // 2, w_out, C)
+      # Inverse on rows: even rows = lo+hi, odd rows = lo-hi
+      return jnp.stack([lo + hi, lo - hi], axis=2).reshape(B, h_out, w_out, C)
+
+    def mix(name, x):
+      x = self.sub(name, nn.Linear, C, **self.kw)(x)
+      return nn.act(self.act)(self.sub(name + 'n', nn.Norm, self.norm)(x))
+
+    # Level-1 decomposition
+    ll1, lh1, hl1, hh1 = haar_fwd(h)
+    # Level-2 decomposition on LL
+    ll2, lh2, hl2, hh2 = haar_fwd(ll1)
+
+    # Per-subband learnable channel mixing + norm + act
+    ll2 = mix('wno_ll2', ll2)
+    lh2 = mix('wno_lh2', lh2)
+    hl2 = mix('wno_hl2', hl2)
+    hh2 = mix('wno_hh2', hh2)
+    lh1 = mix('wno_lh1', lh1)
+    hl1 = mix('wno_hl1', hl1)
+    hh1 = mix('wno_hh1', hh1)
+
+    # Reconstruct level-2 → level-1 LL → full resolution
+    ll1_rec = haar_inv(ll2, lh2, hl2, hh2, H // 2, W // 2)
+    h_wno   = haar_inv(ll1_rec, lh1, hl1, hh1, H, W)
+
+    # Bypass path: per-location linear (like FNO's h_loc), preserves pointwise features
+    h_bypass = self.sub('wno_loc', nn.Linear, C, **self.kw)(h_s_tok).reshape(B, H, W, C)
+    return (h_wno + h_bypass).reshape(B, H * W, C)
+
+  def _attn_op(self, h_s_tok, B, H, W, C):
+    """Multi-head self-attention over spatial tokens with pre-norm and residual.
+
+    Pre-LN + residual matches standard transformer practice and stabilises
+    training; without it the attention output can dominate h_s_tok.
     Complexity O(HW² × C) — cheap for 8×8 (64 tokens).
     """
     heads = self.attn_heads
     dh = max(1, C // heads)
-    qkv = self.sub('attn_qkv', nn.Linear, 3 * heads * dh, **self.kw)(h_s_tok)
-    q, k, v = jnp.split(qkv, 3, axis=-1)                        # (B, HW, heads*dh)
+    x = self.sub('attn_norm', nn.Norm, self.norm)(h_s_tok)         # pre-norm
+    qkv = self.sub('attn_qkv', nn.Linear, 3 * heads * dh, **self.kw)(x)
+    q, k, v = jnp.split(qkv, 3, axis=-1)                          # (B, HW, heads*dh)
     def split_heads(x):
       return x.reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3)
-    q, k, v = split_heads(q), split_heads(k), split_heads(v)    # (B, heads, HW, dh)
+    q, k, v = split_heads(q), split_heads(k), split_heads(v)       # (B, heads, HW, dh)
     attn = jax.nn.softmax(
         q @ k.transpose(0, 1, 3, 2) * (dh ** -0.5), axis=-1)
     out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, H * W, heads * dh)
-    return self.sub('attn_proj', nn.Linear, C, **self.kw)(out)   # (B, HW, C)
+    out = self.sub('attn_proj', nn.Linear, C, **self.kw)(out)
+    return h_s_tok + out                                            # residual
 
   def _conv_op(self, h_s_tok, B, H, W, C):
     """3×3 local convolution via im2col + linear (zero-padded borders).
