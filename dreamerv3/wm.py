@@ -304,7 +304,8 @@ class NOWM(nj.Module):
     deter = self._vec_observe(deter, tokens)        # update h_vec from global pool
     # obslogit uses deter_posterior so assim ops get gradient via KL(rep) and
     # reconstruction (straight-through stoch).  feat/carry stay on deter_prior so
-    # the decoder cannot bypass stoch → KL stays non-zero and stoch remains informative.
+    # the decoder cannot bypass assimilation to read obs directly (dynamics bypass).
+    # For deterministic games, KL will collapse to free_nats floor; that is expected.
     if self.stoch_spatial:
       logit = self._obs_logit_spatial(deter, tokens)
     else:
@@ -317,7 +318,7 @@ class NOWM(nj.Module):
     if self.stoch_spatial:
       B = deter_prior.shape[0]
       stoch = stoch.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
-      logit = logit.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
+      # logit already (B, H, W, stoch, classes) from _obs_logit_spatial / _spatial_logit
     # carry/feat: deter_prior forces decoder to rely on stoch for obs info (no KL collapse).
     # entry:      deter_posterior for imagination starts (spatially-corrected state).
     carry = dict(deter=deter_prior, stoch=stoch)

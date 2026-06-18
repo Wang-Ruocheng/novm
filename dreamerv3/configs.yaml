@@ -228,7 +228,7 @@ nowm:
   agent.dyn.typ: nowm
   agent.enc.simple.mults: [2, 3, 4]
   agent.imag_last: 4
-  agent.imag_loss.actent: 1e-3
+  agent.imag_loss.actent: 3e-3
 
 multi2gpu:
   jax.policy_devices: [0]
