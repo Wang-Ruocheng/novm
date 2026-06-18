@@ -302,13 +302,13 @@ class NOWM(nj.Module):
     deter_prior = deter                              # prior deter: no observation info
     deter = self._spatial_observe(deter, tokens)    # update h_spatial per-location
     deter = self._vec_observe(deter, tokens)        # update h_vec from global pool
-    # obslogit: per-location (spatial stoch) or global, using prior_deter+tokens.
-    # Uses prior_deter so the posterior logit sees dynamics output + current obs;
-    # same interface as _prior (which has no tokens), enabling clean KL comparison.
+    # obslogit uses deter_posterior so assim ops get gradient via KL(rep) and
+    # reconstruction (straight-through stoch).  feat/carry stay on deter_prior so
+    # the decoder cannot bypass stoch → KL stays non-zero and stoch remains informative.
     if self.stoch_spatial:
-      logit = self._obs_logit_spatial(deter_prior, tokens)
+      logit = self._obs_logit_spatial(deter, tokens)
     else:
-      x = tokens if self.absolute else jnp.concatenate([deter_prior, tokens], -1)
+      x = tokens if self.absolute else jnp.concatenate([deter, tokens], -1)
       for i in range(self.obslayers):
         x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
         x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
@@ -318,11 +318,10 @@ class NOWM(nj.Module):
       B = deter_prior.shape[0]
       stoch = stoch.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
       logit = logit.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
-    # carry/feat use posterior_deter (like RSSM): reconstruction and reward losses
-    # flow through _spatial_observe and _vec_observe, training the assimilation ops.
-    # prior_deter is kept in feat for KL computation (_prior must see dynamics output).
-    carry = dict(deter=deter, stoch=stoch)
-    feat = dict(deter=deter, prior_deter=deter_prior, stoch=stoch, logit=logit)
+    # carry/feat: deter_prior forces decoder to rely on stoch for obs info (no KL collapse).
+    # entry:      deter_posterior for imagination starts (spatially-corrected state).
+    carry = dict(deter=deter_prior, stoch=stoch)
+    feat = dict(deter=deter_prior, prior_deter=deter_prior, stoch=stoch, logit=logit)
     entry = dict(deter=deter, stoch=stoch)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
@@ -573,24 +572,28 @@ class NOWM(nj.Module):
     *lead, HW, _ = x.shape
     return x.reshape(*lead, H, W, self.stoch, self.classes)
 
-  def _obs_logit_spatial(self, deter_prior, tokens):
-    """Spatial posterior: per-location obslogit from (h_s_tok[i,j], enc_tok[i,j], h_v)."""
+  def _obs_logit_spatial(self, deter, tokens):
+    """Spatial posterior: per-location obslogit from posterior deter + encoder tokens.
+
+    Receives deter_posterior (after assimilation ops) so KL/reconstruction gradients
+    flow back through _spatial_observe and _vec_observe.
+    """
     H = W = self.lat_size; C = self.lat_chan; sp = self._sp()
-    B = deter_prior.shape[0]
-    h_s_tok = deter_prior[:, :sp].reshape(B, H * W, C)           # (B, HW, C)
-    h_v = deter_prior[:, sp:]                                     # (B, D)
+    B = deter.shape[0]
+    h_s_tok = deter[:, :sp].reshape(B, H * W, C)               # (B, HW, C)
+    h_v = deter[:, sp:]                                         # (B, D)
     C_enc = tokens.shape[-1] // (H * W)
-    enc_tok = tokens.reshape(B, H * W, C_enc)                     # (B, HW, C_enc)
+    enc_tok = tokens.reshape(B, H * W, C_enc)                   # (B, HW, C_enc)
     x = enc_tok if self.absolute else jnp.concatenate(
-        [h_s_tok, enc_tok], axis=-1)                              # (B, HW, C+C_enc)
+        [h_s_tok, enc_tok], axis=-1)                            # (B, HW, C+C_enc)
     h_v_proj = self.sub('obs_v2s', nn.Linear, C, **self.kw)(h_v)  # (B, C)
     x = jnp.concatenate(
         [x, jnp.broadcast_to(h_v_proj[:, None, :], (B, H * W, C))],
-        axis=-1)                                                   # (B, HW, *+C)
+        axis=-1)                                                 # (B, HW, *+C)
     for i in range(self.obslayers):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
-    return self._spatial_logit('obslogit', x)                     # (B, H, W, stoch, classes)
+    return self._spatial_logit('obslogit', x)                   # (B, H, W, stoch, classes)
 
 
   def _spatial_op(self, h_s_tok, B, H, W, C, compute_dtype, ctx, prefix='dyn'):
