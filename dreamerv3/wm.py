@@ -454,7 +454,7 @@ class NOWM(nj.Module):
       if self.stoch_spatial:
         B = deter.shape[0]
         stoch = stoch.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
-        logit = logit.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
+        # logit already (B, H, W, stoch, classes) from _spatial_logit — no reshape needed
       carry = nn.cast(dict(deter=deter, stoch=stoch))
       feat = nn.cast(dict(deter=deter, prior_deter=deter, stoch=stoch, logit=logit))
       assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
@@ -619,6 +619,11 @@ class NOWM(nj.Module):
     h_v = deter[:, sp:]                                         # (B, D)
     C_enc = tokens.shape[-1] // (H * W)
     enc_tok = tokens.reshape(B, H * W, C_enc)                   # (B, HW, C_enc)
+    # Pre-norm: align latent and encoder feature scales before concat
+    # (mirrors _spatial_observe's assim_in_norm; h_s_tok is in GRU-output space,
+    #  enc_tok is in CNN-activation space — their scales differ by initialization)
+    h_s_tok = self.sub('obs_hs_norm', nn.Norm, self.norm)(h_s_tok)
+    enc_tok = self.sub('obs_enc_norm', nn.Norm, self.norm)(enc_tok)
     x = enc_tok if self.absolute else jnp.concatenate(
         [h_s_tok, enc_tok], axis=-1)                            # (B, HW, C+C_enc)
     h_v_proj = self.sub('obs_v2s', nn.Linear, C, **self.kw)(h_v)  # (B, C)
