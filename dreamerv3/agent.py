@@ -50,7 +50,7 @@ class Agent(embodied.jax.Agent):
 
     self.feat2tensor = lambda x: jnp.concatenate([
         nn.cast(x['deter']),
-        nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+        nn.cast(x['stoch']).reshape(x['deter'].shape[:-1] + (-1,))], -1)
 
     scalar = elements.Space(np.float32, ())
     binary = elements.Space(bool, (), 0, 2)

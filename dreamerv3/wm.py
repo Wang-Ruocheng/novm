@@ -151,9 +151,8 @@ class Decoder(nj.Module):
       if self.bspace:
         u, g = math.prod(shape), self.bspace
         x0, x1 = nn.cast((feat['deter'], feat['stoch']))
-        x1 = x1.reshape((*x1.shape[:-2], -1))
         x0 = x0.reshape((-1, x0.shape[-1]))
-        x1 = x1.reshape((-1, x1.shape[-1]))
+        x1 = x1.reshape((x0.shape[0], -1))
         x0 = self.sub('sp0', nn.BlockLinear, u, g, **self.kw)(x0)
         x0 = einops.rearrange(
             x0, '... (g h w c) -> ... h w (g c)',
@@ -254,14 +253,23 @@ class NOWM(nj.Module):
 
   @property
   def entry_space(self):
+    stoch_shape = (
+        (self.lat_size, self.lat_size, self.stoch, self.classes)
+        if self.stoch_spatial else
+        (self._stoch_total(), self.classes))
     return dict(
         deter=elements.Space(np.float32, self._total()),
-        stoch=elements.Space(np.float32, (self._stoch_total(), self.classes)))
+        stoch=elements.Space(np.float32, stoch_shape))
 
   def initial(self, bsize):
+    if self.stoch_spatial:
+      stoch = jnp.zeros(
+          [bsize, self.lat_size, self.lat_size, self.stoch, self.classes], f32)
+    else:
+      stoch = jnp.zeros([bsize, self.stoch, self.classes], f32)
     return nn.cast(dict(
         deter=jnp.zeros([bsize, self._total()], f32),
-        stoch=jnp.zeros([bsize, self._stoch_total(), self.classes], f32)))
+        stoch=stoch))
 
   def truncate(self, entries, carry=None):
     assert entries['deter'].ndim == 3, entries['deter'].shape
@@ -305,6 +313,10 @@ class NOWM(nj.Module):
         x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
       logit = self._logit('obslogit', x)
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+    if self.stoch_spatial:
+      B = deter_prior.shape[0]
+      stoch = stoch.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
+      logit = logit.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
     # carry uses prior_deter: past obs enter only through the stoch bottleneck,
     # forcing the decoder to rely on current stoch → KL stays non-zero.
     # entry keeps posterior_deter so imagination starts from spatially-corrected states.
@@ -388,6 +400,10 @@ class NOWM(nj.Module):
       deter = self._core(carry['deter'], carry['stoch'], actemb)
       logit = self._prior(deter)
       stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+      if self.stoch_spatial:
+        B = deter.shape[0]
+        stoch = stoch.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
+        logit = logit.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
       carry = nn.cast(dict(deter=deter, stoch=stoch))
       feat = nn.cast(dict(deter=deter, prior_deter=deter, stoch=stoch, logit=logit))
       assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
@@ -520,11 +536,12 @@ class NOWM(nj.Module):
     return x.reshape(x.shape[:-1] + (self.stoch, self.classes))
 
   def _spatial_logit(self, name, x):
-    """Per-location logit: (..., HW, hidden) → (..., HW*stoch, classes)."""
+    """Per-location logit: (..., HW, hidden) → (..., H, W, stoch, classes)."""
+    H = W = self.lat_size
     kw = dict(**self.kw, outscale=self.outscale)
     x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x)  # (..., HW, stoch*cls)
     *lead, HW, _ = x.shape
-    return x.reshape(*lead, HW * self.stoch, self.classes)
+    return x.reshape(*lead, H, W, self.stoch, self.classes)
 
   def _obs_logit_spatial(self, deter_prior, tokens):
     """Spatial posterior: per-location obslogit from (h_s_tok[i,j], enc_tok[i,j], h_v)."""
@@ -543,7 +560,7 @@ class NOWM(nj.Module):
     for i in range(self.obslayers):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
-    return self._spatial_logit('obslogit', x)                     # (B, HW*stoch, classes)
+    return self._spatial_logit('obslogit', x)                     # (B, H, W, stoch, classes)
 
 
 
@@ -683,6 +700,9 @@ class NOWM(nj.Module):
     return self.sub('conv_proj', nn.Linear, C, **self.kw)(h_patches)  # (B, HW, C)
 
   def _dist(self, logits):
+    if logits.ndim >= 5:  # spatial: (..., H, W, stoch, classes)
+      *lead, H, W, S, C = logits.shape
+      logits = logits.reshape(*lead, H * W * S, C)
     out = embodied.jax.outs.OneHot(logits, self.unimix)
     out = embodied.jax.outs.Agg(out, 1, jnp.sum)
     return out
