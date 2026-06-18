@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import ninjax as nj
 import numpy as np
 import elements
-from dreamerv3 import rssm
+from dreamerv3 import wm as rssm
 
 B, T = 2, 4
 lat_size, lat_chan, deter_d = 4, 4, 8

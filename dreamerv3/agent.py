@@ -10,7 +10,7 @@ import ninjax as nj
 import numpy as np
 import optax
 
-from . import rssm
+from . import wm
 
 f32 = jnp.float32
 i32 = jnp.int32
@@ -39,13 +39,13 @@ class Agent(embodied.jax.Agent):
     enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
     dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
     self.enc = {
-        'simple': rssm.Encoder,
+        'simple': wm.Encoder,
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
     self.dyn = {
-        'nowm': rssm.NOWM,
+        'nowm': wm.NOWM,
     }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
     self.dec = {
-        'simple': rssm.Decoder,
+        'simple': wm.Decoder,
     }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
 
     self.feat2tensor = lambda x: jnp.concatenate([

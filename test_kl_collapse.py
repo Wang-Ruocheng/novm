@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import ninjax as nj
 import numpy as np
 import elements
-from dreamerv3 import rssm
+from dreamerv3 import wm as rssm
 import embodied.jax.nets as nn
 
 B, T = 4, 8

@@ -204,6 +204,7 @@ class NOWM(nj.Module):
   h_vec     (B, deter): GRU global state
 
   spatial_op choices:
+    'wno'  — Wavelet Neural Operator (multi-scale Haar, localized objects)
     'fno'  — Fourier Neural Operator (global spectral mixing, smooth PDEs)
     'attn' — local self-attention (arbitrary spatial relations, discrete objects)
     'conv' — 3×3 local convolution (local motion, fast)
@@ -411,8 +412,9 @@ class NOWM(nj.Module):
     dyn = self._dist(sg(post)).kl(self._dist(prior))
     rep = self._dist(post).kl(self._dist(sg(prior)))
     if self.free_nats:
-      dyn = jnp.maximum(dyn, self.free_nats)
-      rep = jnp.maximum(rep, self.free_nats)
+      fn = self.free_nats * self._stoch_total()  # per-variable → total floor
+      dyn = jnp.maximum(dyn, fn)
+      rep = jnp.maximum(rep, fn)
     losses = {'dyn': dyn, 'rep': rep}
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
@@ -440,14 +442,15 @@ class NOWM(nj.Module):
     h_s_tok = h_s_tok + h_v_proj[:, None, :]                       # (B, HW, C)
     h_s_tok = self.sub('mix_norm_s', nn.Norm, self.norm)(h_s_tok)
 
-    h_s = h_s_tok.reshape(B, H, W, C)
-
-    # ---- Spatial operator: FNO / Attn / Conv ----
+    # ---- Spatial operator: FNO / Attn / Conv / WNO ----
     h_s_mixed = self._spatial_op(h_s_tok, B, H, W, C, deter.dtype)
 
-    # Forcing term: action broadcast to all spatial locations
-    act_f = self.sub('op_act', nn.Linear, C, **self.kw)(action)
-    act_f = nn.act(self.act)(self.sub('op_actnorm', nn.Norm, self.norm)(act_f))
+    # Action operator: FiLM (Feature-wise Linear Modulation)
+    # O_act(h) = γ_a ⊙ h + β_a  — multiplicative + additive, uniform across space
+    # γ ∈ [0,2] via sigmoid*2, initialized ~1 (identity-like at start)
+    act_film = self.sub('op_act', nn.Linear, 2 * C, **self.kw)(action)  # (B, 2C)
+    act_γ, act_β = jnp.split(act_film, 2, axis=-1)                      # (B, C) each
+    act_γ = jax.nn.sigmoid(act_γ) * 2                                   # [0, 2]
 
     # Stochastic forcing: per-location (spatial) or broadcast (global)
     # Spatial: η(x,t) per location — stochastic PDE noise field
@@ -461,8 +464,8 @@ class NOWM(nj.Module):
       sto_f = nn.act(self.act)(self.sub('op_stonorm', nn.Norm, self.norm)(sto_f))
       sto_f = sto_f[:, None, :]                                            # broadcast
 
-    # Add forcings and apply nonlinearity
-    cand_s_tok = h_s_mixed + act_f[:, None, :] + sto_f
+    # Apply action operator then add stochastic forcing
+    cand_s_tok = act_γ[:, None, :] * h_s_mixed + act_β[:, None, :] + sto_f
     cand_s_tok = nn.act(self.act)(
         self.sub('op_candnorm', nn.Norm, self.norm)(cand_s_tok))
 
@@ -499,6 +502,9 @@ class NOWM(nj.Module):
     if self.stoch_spatial:
       H = W = self.lat_size; C = self.lat_chan; sp = self._sp()
       h_s_tok = feat[..., :sp].reshape(*feat.shape[:-1], H * W, C)  # (..., HW, C)
+      h_v = feat[..., sp:]                                           # (..., D)
+      h_v_proj = self.sub('prior_v2s', nn.Linear, C, **self.kw)(h_v)  # (..., C)
+      h_s_tok = h_s_tok + h_v_proj[..., None, :]                    # (..., HW, C)
       x = h_s_tok
       for i in range(self.imglayers):
         x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
@@ -510,7 +516,6 @@ class NOWM(nj.Module):
         x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
         x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
       return self._logit('priorlogit', x)
-
   def _logit(self, name, x):
     kw = dict(**self.kw, outscale=self.outscale)
     x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x)
@@ -524,14 +529,19 @@ class NOWM(nj.Module):
     return x.reshape(*lead, HW * self.stoch, self.classes)
 
   def _obs_logit_spatial(self, deter_prior, tokens):
-    """Spatial posterior: per-location obslogit from (h_s_tok[i,j], enc_tok[i,j])."""
+    """Spatial posterior: per-location obslogit from (h_s_tok[i,j], enc_tok[i,j], h_v)."""
     H = W = self.lat_size; C = self.lat_chan; sp = self._sp()
     B = deter_prior.shape[0]
     h_s_tok = deter_prior[:, :sp].reshape(B, H * W, C)           # (B, HW, C)
+    h_v = deter_prior[:, sp:]                                     # (B, D)
     C_enc = tokens.shape[-1] // (H * W)
     enc_tok = tokens.reshape(B, H * W, C_enc)                     # (B, HW, C_enc)
     x = enc_tok if self.absolute else jnp.concatenate(
         [h_s_tok, enc_tok], axis=-1)                              # (B, HW, C+C_enc)
+    h_v_proj = self.sub('obs_v2s', nn.Linear, C, **self.kw)(h_v)  # (B, C)
+    x = jnp.concatenate(
+        [x, jnp.broadcast_to(h_v_proj[:, None, :], (B, H * W, C))],
+        axis=-1)                                                   # (B, HW, *+C)
     for i in range(self.obslayers):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
@@ -584,10 +594,12 @@ class NOWM(nj.Module):
     Per-subband: Linear(C,C) + norm + act — 7 blocks, ~1.8K params.
     Bypass path (like FNO h_loc) preserves pointwise features.
     """
+    compute_dtype = h_s_tok.dtype
     h = h_s_tok.reshape(B, H, W, C)
 
     def haar_fwd(x):
-      """Single-level 2D Haar forward: (B,h,w,C) → (ll,lh,hl,hh) each (B,h/2,w/2,C)."""
+      """Single-level 2D Haar forward in float32 to avoid bfloat16 cancellation."""
+      x = x.astype(jnp.float32)
       a, b = x[:, ::2], x[:, 1::2]
       lo = (a + b) * 0.5
       hi = (a - b) * 0.5
@@ -595,7 +607,8 @@ class NOWM(nj.Module):
       lh = (lo[:, :, ::2] - lo[:, :, 1::2]) * 0.5
       hl = (hi[:, :, ::2] + hi[:, :, 1::2]) * 0.5
       hh = (hi[:, :, ::2] - hi[:, :, 1::2]) * 0.5
-      return ll, lh, hl, hh
+      return (ll.astype(compute_dtype), lh.astype(compute_dtype),
+              hl.astype(compute_dtype), hh.astype(compute_dtype))
 
     def haar_inv(ll, lh, hl, hh, h_out, w_out):
       """Single-level 2D Haar inverse via stack+reshape (exact reconstruction)."""
