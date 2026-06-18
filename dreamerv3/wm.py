@@ -303,7 +303,8 @@ class NOWM(nj.Module):
     deter = self._spatial_observe(deter, tokens)    # update h_spatial per-location
     deter = self._vec_observe(deter, tokens)        # update h_vec from global pool
     # obslogit: per-location (spatial stoch) or global, using prior_deter+tokens.
-    # prior_deter is the ONLY input that differs from prior → stoch must carry obs.
+    # Uses prior_deter so the posterior logit sees dynamics output + current obs;
+    # same interface as _prior (which has no tokens), enabling clean KL comparison.
     if self.stoch_spatial:
       logit = self._obs_logit_spatial(deter_prior, tokens)
     else:
@@ -317,11 +318,11 @@ class NOWM(nj.Module):
       B = deter_prior.shape[0]
       stoch = stoch.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
       logit = logit.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
-    # carry uses prior_deter: past obs enter only through the stoch bottleneck,
-    # forcing the decoder to rely on current stoch → KL stays non-zero.
-    # entry keeps posterior_deter so imagination starts from spatially-corrected states.
-    carry = dict(deter=deter_prior, stoch=stoch)
-    feat = dict(deter=deter_prior, prior_deter=deter_prior, stoch=stoch, logit=logit)
+    # carry/feat use posterior_deter (like RSSM): reconstruction and reward losses
+    # flow through _spatial_observe and _vec_observe, training the assimilation ops.
+    # prior_deter is kept in feat for KL computation (_prior must see dynamics output).
+    carry = dict(deter=deter, stoch=stoch)
+    feat = dict(deter=deter, prior_deter=deter_prior, stoch=stoch, logit=logit)
     entry = dict(deter=deter, stoch=stoch)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
@@ -464,7 +465,8 @@ class NOWM(nj.Module):
     # Split deter → (h_spatial, h_vec)
     h_s = deter[:, :sp].reshape(B, H, W, C)   # (B, H, W, C)
     h_v = deter[:, sp:]                         # (B, D)
-    h_s_tok = h_s.reshape(B, H * W, C)          # (B, HW, C) for attention
+    h_s_tok = h_s.reshape(B, H * W, C)          # (B, HW, C) original — kept for identity path
+    h_s_tok_norm = self.sub('mix_norm_s', nn.Norm, self.norm)(h_s_tok)  # normalized — for operator input
 
     # ---- Context embedding: action + global state ----
     # Both action and h_vec condition the spatial operator INSIDE WNO (per-subband FiLM).
@@ -473,10 +475,9 @@ class NOWM(nj.Module):
     h_v_emb = self.sub('op_hv',  nn.Linear, C, **self.kw)(h_v)         # (B, C)
     ctx = nn.act(self.act)(
         self.sub('op_ctx_norm', nn.Norm, self.norm)(act_emb + h_v_emb))  # (B, C)
-    h_s_tok = self.sub('mix_norm_s', nn.Norm, self.norm)(h_s_tok)
 
     # ---- Spatial operator: conditioned on ctx inside WNO subbands ----
-    h_s_mixed = self._spatial_op(h_s_tok, B, H, W, C, deter.dtype, ctx)
+    h_s_mixed = self._spatial_op(h_s_tok_norm, B, H, W, C, deter.dtype, ctx)
 
     # Stochastic forcing: per-location (spatial) or broadcast (global)
     # Spatial: η(x,t) per location — stochastic PDE noise field
@@ -496,9 +497,10 @@ class NOWM(nj.Module):
         self.sub('op_candnorm', nn.Norm, self.norm)(cand_s_tok))
 
     # Gated update for h_spatial (GRU-style stability)
+    # Gate uses normalized scale (same as cand_s_tok); identity path uses raw h_s_tok.
     gate_s = jax.nn.sigmoid(
         self.sub('op_gate', nn.Linear, C, **self.kw)(
-            jnp.concatenate([h_s_tok, cand_s_tok], -1)) - 1)
+            jnp.concatenate([h_s_tok_norm, cand_s_tok], -1)) - 1)
     h_s_new = (
         gate_s * jnp.tanh(cand_s_tok) + (1 - gate_s) * h_s_tok
     ).reshape(B, H, W, C)
@@ -538,10 +540,10 @@ class NOWM(nj.Module):
       H = W = self.lat_size; C = self.lat_chan; sp = self._sp()
       h_s_tok = feat[..., :sp].reshape(*feat.shape[:-1], H * W, C)  # (..., HW, C)
       h_v = feat[..., sp:]                                           # (..., D)
-      # h_vec → ctx for FiLM conditioning (mirrors WNO per-subband conditioning)
+      # h_vec → hidden-dim ctx for FiLM (avoids C=lat_chan bottleneck when hidden >> C)
       ctx_p = nn.act(self.act)(
           self.sub('prior_ctx_norm', nn.Norm, self.norm)(
-              self.sub('prior_ctx', nn.Linear, C, **self.kw)(h_v)))   # (..., C)
+              self.sub('prior_ctx', nn.Linear, self.hidden, **self.kw)(h_v)))   # (..., hidden)
       x = h_s_tok
       for i in range(self.imglayers):
         x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)   # (..., HW, hidden)
@@ -589,7 +591,6 @@ class NOWM(nj.Module):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
     return self._spatial_logit('obslogit', x)                     # (B, H, W, stoch, classes)
-
 
 
   def _spatial_op(self, h_s_tok, B, H, W, C, compute_dtype, ctx, prefix='dyn'):
