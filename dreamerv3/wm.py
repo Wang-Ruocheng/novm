@@ -369,12 +369,10 @@ class NOWM(nj.Module):
 
     Two paths for observation info:
       1. Per-location additive injection: enc_tok[i,j] added to h_s[i,j] before operator
-      2. Global FiLM conditioning: pooled enc + h_v → ctx_obs broadcast-added after conv
+      2. FiLM conditioning: pooled enc + h_v → ctx_obs modulates operator output
 
-    Deliberately uses a local 3×3 conv (not FNO) for the assimilation operator:
-    observation tokens are already spatially aligned with h_spatial via enc_inj, so
-    global spectral mixing is not needed here; a local conv propagates nearby corrections
-    at lower cost and leaves FNO exclusively for the dynamics step.
+    Uses the same spatial_op as the dynamics step (prefix='assim' → independent weights),
+    giving the assimilation full global receptive field (e.g. FNO spectral mixing).
     """
     H = W = self.lat_size
     C = self.lat_chan
@@ -399,9 +397,9 @@ class NOWM(nj.Module):
             self.sub('assim_ctx', nn.Linear, C, **self.kw)(
                 jnp.concatenate([enc_global, h_v], axis=-1))))  # (B, C)
 
-    # Assimilation operator: local 3×3 conv + broadcast global context
-    # (FNO reserved for the dynamics step in _core; see docstring)
-    h_s_cand = self._conv_op(h_s_in, B, H, W, C, prefix='assim') + obs_ctx[:, None, :]
+    # Assimilation operator: uses the same spatial op as dynamics (prefix='assim')
+    # obs_ctx conditions the operator via FiLM inside _spatial_op.
+    h_s_cand = self._spatial_op(h_s_in, B, H, W, C, h_s_in.dtype, obs_ctx, prefix='assim')
 
     # Gated update (bias=-1 → near-identity at init)
     gate = jax.nn.sigmoid(
@@ -432,12 +430,15 @@ class NOWM(nj.Module):
     enc_tok = tokens.reshape(B, H * W, C_enc)   # (B, HW, C_enc)
 
     # h_vec-conditioned attention: select relevant spatial regions from encoder
-    q_vo = self.sub('vobs_q', nn.Linear, C_enc, **self.kw)(h_v)         # (B, C_enc)
-    k_vo = self.sub('vobs_k', nn.Linear, C_enc, **self.kw)(enc_tok)     # (B, HW, C_enc)
-    v_vo = self.sub('vobs_v', nn.Linear, C_enc, **self.kw)(enc_tok)     # (B, HW, C_enc)
+    heads = self.attn_heads; dh = max(1, C_enc // heads)
+    q_vo = self.sub('vobs_q', nn.Linear, heads * dh, **self.kw)(h_v).reshape(B, heads, dh)
+    k_vo = (self.sub('vobs_k', nn.Linear, heads * dh, **self.kw)(enc_tok)
+            .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
+    v_vo = (self.sub('vobs_v', nn.Linear, heads * dh, **self.kw)(enc_tok)
+            .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
     attn_vo = jax.nn.softmax(
-        jnp.einsum('bc,bnc->bn', q_vo, k_vo) * (C_enc ** -0.5), axis=-1)
-    enc_attended = jnp.einsum('bn,bnc->bc', attn_vo, v_vo)              # (B, C_enc)
+        jnp.einsum('bhd,bhnd->bhn', q_vo, k_vo) * (dh ** -0.5), axis=-1)
+    enc_attended = jnp.einsum('bhn,bhnd->bhd', attn_vo, v_vo).reshape(B, heads * dh)
 
     # GRU update (mirrors _core's h_v GRU, driven by enc_attended instead of s2g+action)
     gru_in = jnp.concatenate([h_v, enc_attended], axis=-1)
@@ -550,12 +551,15 @@ class NOWM(nj.Module):
     # h_vec acts as query: it actively selects which spatial locations are relevant
     # (e.g. "health low" → attend to nearby hazards), rather than blind mean+max.
     h_s_tok_new = h_s_new.reshape(B, H * W, C)
-    q_s2g = self.sub('s2g_q', nn.Linear, C, **self.kw)(h_v)          # (B, C)
-    k_s2g = self.sub('s2g_k', nn.Linear, C, **self.kw)(h_s_tok_new)  # (B, HW, C)
-    v_s2g = self.sub('s2g_v', nn.Linear, C, **self.kw)(h_s_tok_new)  # (B, HW, C)
+    heads = self.attn_heads; dh = max(1, C // heads)
+    q_s2g = self.sub('s2g_q', nn.Linear, heads * dh, **self.kw)(h_v).reshape(B, heads, dh)
+    k_s2g = (self.sub('s2g_k', nn.Linear, heads * dh, **self.kw)(h_s_tok_new)
+             .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
+    v_s2g = (self.sub('s2g_v', nn.Linear, heads * dh, **self.kw)(h_s_tok_new)
+             .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
     attn_s2g = jax.nn.softmax(
-        jnp.einsum('bc,bnc->bn', q_s2g, k_s2g) * (C ** -0.5), axis=-1)  # (B, HW)
-    s2g = jnp.einsum('bn,bnc->bc', attn_s2g, v_s2g)                  # (B, C)
+        jnp.einsum('bhd,bhnd->bhn', q_s2g, k_s2g) * (dh ** -0.5), axis=-1)
+    s2g = jnp.einsum('bhn,bhnd->bhd', attn_s2g, v_s2g).reshape(B, heads * dh)
     s2g = self.sub('s2g_proj', nn.Linear, self.hidden, **self.kw)(s2g)
     s2g = nn.act(self.act)(self.sub('s2g_norm', nn.Norm, self.norm)(s2g))
 
@@ -647,17 +651,22 @@ class NOWM(nj.Module):
 
     prefix distinguishes dynamics weights ('dyn') from assimilation weights ('assim'),
     allowing the same operator structure to be reused with independent parameters.
+    fno/attn/conv use FiLM conditioning on ctx; wno handles its own per-subband FiLM.
     """
     if self.spatial_op == 'fno':
-      return self._fno_op(h_s_tok, B, H, W, C, compute_dtype, prefix) + ctx[:, None, :]
+      out = self._fno_op(h_s_tok, B, H, W, C, compute_dtype, prefix)
     elif self.spatial_op == 'attn':
-      return self._attn_op(h_s_tok, B, H, W, C, prefix) + ctx[:, None, :]
+      out = self._attn_op(h_s_tok, B, H, W, C, prefix)
     elif self.spatial_op == 'conv':
-      return self._conv_op(h_s_tok, B, H, W, C, prefix) + ctx[:, None, :]
+      out = self._conv_op(h_s_tok, B, H, W, C, prefix)
     elif self.spatial_op == 'wno':
       return self._wno_op(h_s_tok, B, H, W, C, ctx, prefix)
     else:
       raise ValueError(f'Unknown spatial_op: {self.spatial_op!r}')
+    film = self.sub(f'{prefix}_ctx_film', nn.Linear, 2 * C, **self.kw)(ctx)
+    γ, β = jnp.split(film, 2, axis=-1)
+    γ = jax.nn.sigmoid(γ) * 2
+    return γ[:, None, :] * out + β[:, None, :]
 
   def _fno_op(self, h_s_tok, B, H, W, C, compute_dtype, prefix='dyn'):
     """FNO-2D: per-mode spectral channel mixing + per-location bypass.
@@ -675,8 +684,9 @@ class NOWM(nj.Module):
     h_ri = self.sub(f'{prefix}_spec', nn.Linear, 2 * C, **self.kw)(
         h_ri.astype(compute_dtype))                              # (B, m, m, 2C)
     h_ri = h_ri.astype(jnp.float32)
-    h_fft_new = jnp.zeros_like(h_fft).at[:, :m, :m, :].set(
-        h_ri[..., :C] + 1j * h_ri[..., C:])
+    h_fft_new = jnp.pad(
+        (h_ri[..., :C] + 1j * h_ri[..., C:]).astype(jnp.complex64),
+        ((0, 0), (0, H - m), (0, W // 2 + 1 - m), (0, 0)))
     h_spec = jnp.fft.irfft2(
         h_fft_new, s=(H, W), axes=(1, 2)).astype(compute_dtype)
     h_loc = self.sub(f'{prefix}_loc', nn.Linear, C, **self.kw)(h_s_tok).reshape(B, H, W, C)

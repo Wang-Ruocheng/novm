@@ -471,6 +471,7 @@ def imag_loss(
   metrics['ret_rate'] = (jnp.abs(ret_normed) >= 1.0).mean()
   metrics['pol_gate'] = pol_gate
   metrics['actent'] = f32(actent)
+  metrics['debug_min_rand'] = jnp.zeros(()) + min_rand
   for k in act:
     metrics[f'ent/{k}'] = ents[k].mean()
     if hasattr(policy[k], 'minent'):
