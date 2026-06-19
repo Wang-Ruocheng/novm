@@ -482,12 +482,13 @@ class NOWM(nj.Module):
     carry, entries, feat = self.observe(carry, tokens, acts, reset, training)
     prior = self._prior(feat['prior_deter'])  # must use prior deter, not posterior
     post = feat['logit']
-    dyn = self._dist(sg(post)).kl(self._dist(prior))
-    rep = self._dist(post).kl(self._dist(sg(prior)))
+    dyn_kl = self._kl_per_var(sg(post), prior)   # (..., N)
+    rep_kl = self._kl_per_var(post, sg(prior))   # (..., N)
     if self.free_nats:
-      fn = self.free_nats * self._stoch_total()  # per-variable → total floor
-      dyn = jnp.maximum(dyn, fn)
-      rep = jnp.maximum(rep, fn)
+      dyn_kl = jnp.maximum(dyn_kl, self.free_nats)
+      rep_kl = jnp.maximum(rep_kl, self.free_nats)
+    dyn = dyn_kl.sum(-1)
+    rep = rep_kl.sum(-1)
     losses = {'dyn': dyn, 'rep': rep}
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
@@ -580,18 +581,17 @@ class NOWM(nj.Module):
       H = W = self.lat_size; C = self.lat_chan; sp = self._sp()
       h_s_tok = feat[..., :sp].reshape(*feat.shape[:-1], H * W, C)  # (..., HW, C)
       h_v = feat[..., sp:]                                           # (..., D)
-      # h_vec → hidden-dim ctx for FiLM (avoids C=lat_chan bottleneck when hidden >> C)
-      ctx_p = nn.act(self.act)(
-          self.sub('prior_ctx_norm', nn.Norm, self.norm)(
-              self.sub('prior_ctx', nn.Linear, self.hidden, **self.kw)(h_v)))   # (..., hidden)
       x = h_s_tok
       for i in range(self.imglayers):
         x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)   # (..., HW, hidden)
-        x = self.sub(f'prior{i}norm', nn.Norm, self.norm)(x)              # norm first
+        x = self.sub(f'prior{i}norm', nn.Norm, self.norm)(x)
+        ctx_p = nn.act(self.act)(
+            self.sub(f'prior{i}_ctx_norm', nn.Norm, self.norm)(
+                self.sub(f'prior{i}_ctx', nn.Linear, self.hidden, **self.kw)(h_v)))
         film = self.sub(f'prior{i}_film', nn.Linear, 2 * self.hidden, **self.kw)(ctx_p)
         γ, β = jnp.split(film, 2, axis=-1)
         γ = jax.nn.sigmoid(γ) * 2
-        x = nn.act(self.act)(γ[..., None, :] * x + β[..., None, :])      # FiLM then act
+        x = nn.act(self.act)(γ[..., None, :] * x + β[..., None, :])
       return self._spatial_logit('priorlogit', x)
     else:
       x = feat
@@ -690,6 +690,8 @@ class NOWM(nj.Module):
     current global state (score, health, etc.).
     """
     compute_dtype = h_s_tok.dtype
+    assert H % 4 == 0 and W % 4 == 0, (
+        f'_wno_op requires lat_size divisible by 4, got {H}×{W}')
     h = h_s_tok.reshape(B, H, W, C)
 
     def haar_fwd(x):
@@ -785,3 +787,12 @@ class NOWM(nj.Module):
     out = embodied.jax.outs.OneHot(logits, self.unimix)
     out = embodied.jax.outs.Agg(out, 1, jnp.sum)
     return out
+
+  def _kl_per_var(self, post_logits, prior_logits):
+    """Per-variable KL (..., N) before summing — for correct per-location free_nats floor."""
+    def _prep(logits):
+      if logits.ndim >= 5:
+        *lead, H, W, S, C = logits.shape
+        logits = logits.reshape(*lead, H * W * S, C)
+      return embodied.jax.outs.OneHot(logits, self.unimix)
+    return _prep(post_logits).kl(_prep(prior_logits))

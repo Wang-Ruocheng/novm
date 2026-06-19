@@ -519,7 +519,7 @@ class ActentAdaptor(nj.Module):
   """SAC-style adaptive entropy coefficient.
 
   Maintains log_actent as scalar state.  Updated toward cur_rand == target_rand
-  via: log_actent += rate * (cur_rand - target_rand).  Not in self.modules so it
+  via: log_actent += rate * (target_rand - cur_rand).  Not in self.modules so it
   is never touched by the gradient optimizer; state is still checkpointed.
   """
 
@@ -535,7 +535,7 @@ class ActentAdaptor(nj.Module):
   def __call__(self, cur_rand, update=True):
     log_v = self.log_val.read()
     if update:
-      new_log = log_v + self._rate * sg(cur_rand - self._target)
+      new_log = log_v + self._rate * sg(self._target - cur_rand)
       new_log = jnp.clip(new_log, self._lo, self._hi)
       self.log_val.write(new_log)
       log_v = new_log
