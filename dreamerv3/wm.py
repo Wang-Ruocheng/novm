@@ -369,7 +369,12 @@ class NOWM(nj.Module):
 
     Two paths for observation info:
       1. Per-location additive injection: enc_tok[i,j] added to h_s[i,j] before operator
-      2. Global FiLM conditioning: pooled enc + h_v → ctx_obs conditions operator behavior
+      2. Global FiLM conditioning: pooled enc + h_v → ctx_obs broadcast-added after conv
+
+    Deliberately uses a local 3×3 conv (not FNO) for the assimilation operator:
+    observation tokens are already spatially aligned with h_spatial via enc_inj, so
+    global spectral mixing is not needed here; a local conv propagates nearby corrections
+    at lower cost and leaves FNO exclusively for the dynamics step.
     """
     H = W = self.lat_size
     C = self.lat_chan
@@ -394,8 +399,9 @@ class NOWM(nj.Module):
             self.sub('assim_ctx', nn.Linear, C, **self.kw)(
                 jnp.concatenate([enc_global, h_v], axis=-1))))  # (B, C)
 
-    # Assimilation operator: same structure as dynamics, independent weights
-    h_s_cand = self._spatial_op(h_s_in, B, H, W, C, deter.dtype, obs_ctx, prefix='assim')
+    # Assimilation operator: local 3×3 conv + broadcast global context
+    # (FNO reserved for the dynamics step in _core; see docstring)
+    h_s_cand = self._conv_op(h_s_in, B, H, W, C, prefix='assim') + obs_ctx[:, None, :]
 
     # Gated update (bias=-1 → near-identity at init)
     gate = jax.nn.sigmoid(

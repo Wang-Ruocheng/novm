@@ -73,6 +73,15 @@ class Agent(embodied.jax.Agent):
 
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+
+    self.actent_adapt = None
+    if config.imag_loss.get('target_rand', 0.0) > 0.0:
+      self.actent_adapt = ActentAdaptor(
+          init=config.imag_loss.actent,
+          target_rand=config.imag_loss.target_rand,
+          rate=config.imag_loss.get('actent_rate', 3e-4),
+          name='actent_adapt')
+
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
@@ -211,6 +220,7 @@ class Agent(embodied.jax.Agent):
         update=training,
         contdisc=self.config.contdisc,
         horizon=self.config.horizon,
+        actent_adapt=self.actent_adapt,
         **self.config.imag_loss)
     losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
     metrics.update(mets)
@@ -391,6 +401,9 @@ def imag_loss(
     actent=3e-4,
     slowreg=1.0,
     min_rand=0.0,
+    target_rand=0.0,
+    actent_rate=3e-4,
+    actent_adapt=None,
 ):
   losses = {}
   metrics = {}
@@ -411,6 +424,16 @@ def imag_loss(
   adv_normed = (adv - aoffset) / ascale
   logpi = sum([v.logp(sg(act[k]))[:, :-1] for k, v in policy.items()])
   ents = {k: v.entropy()[:, :-1] for k, v in policy.items()}
+
+  # SAC-style adaptive actent: update log_actent toward target_rand
+  if actent_adapt is not None:
+    rands = [
+        (ents[k].mean() - v.minent) / (v.maxent - v.minent + 1e-8)
+        for k, v in policy.items()
+        if hasattr(v, 'minent') and hasattr(v, 'maxent')]
+    avg_rand = sg(sum(rands) / len(rands)) if rands else f32(0.5)
+    actent = actent_adapt(avg_rand, update)
+
   # Entropy floor gate: when rand < min_rand, block the policy gradient so only
   # the actent*H term remains.  A collapsed policy (rand→0) has H≈0 too, so the
   # entropy gradient vanishes and the collapse is stable — the gate breaks this by
@@ -419,8 +442,8 @@ def imag_loss(
   if min_rand > 0.0:
     for k, v in policy.items():
       if hasattr(v, 'minent') and hasattr(v, 'maxent'):
-        cur_rand = sg((ents[k].mean() - v.minent) / (v.maxent - v.minent + 1e-8))
-        pol_gate = jnp.minimum(pol_gate, (cur_rand >= min_rand).astype(f32))
+        gate_rand = sg((ents[k].mean() - v.minent) / (v.maxent - v.minent + 1e-8))
+        pol_gate = jnp.minimum(pol_gate, (gate_rand >= min_rand).astype(f32))
   policy_loss = sg(weight[:, :-1]) * -(
       pol_gate * logpi * sg(adv_normed) + actent * sum(ents.values()))
   losses['policy'] = policy_loss
@@ -447,6 +470,7 @@ def imag_loss(
   metrics['ret_max'] = ret_normed.max()
   metrics['ret_rate'] = (jnp.abs(ret_normed) >= 1.0).mean()
   metrics['pol_gate'] = pol_gate
+  metrics['actent'] = f32(actent)
   for k in act:
     metrics[f'ent/{k}'] = ents[k].mean()
     if hasattr(policy[k], 'minent'):
@@ -489,6 +513,33 @@ def repl_loss(
   metrics = {}
 
   return losses, outs, metrics
+
+
+class ActentAdaptor(nj.Module):
+  """SAC-style adaptive entropy coefficient.
+
+  Maintains log_actent as scalar state.  Updated toward cur_rand == target_rand
+  via: log_actent += rate * (cur_rand - target_rand).  Not in self.modules so it
+  is never touched by the gradient optimizer; state is still checkpointed.
+  """
+
+  def __init__(self, init=3e-4, target_rand=0.5, rate=3e-4, lo=1e-5, hi=0.1):
+    self._target = target_rand
+    self._rate = rate
+    self._lo = float(np.log(lo))
+    self._hi = float(np.log(hi))
+    log_init = float(np.log(init))
+    self.log_val = nj.Variable(
+        lambda s, d: jnp.full(s, log_init, d), (), f32, name='log_val')
+
+  def __call__(self, cur_rand, update=True):
+    log_v = self.log_val.read()
+    if update:
+      new_log = log_v + self._rate * sg(cur_rand - self._target)
+      new_log = jnp.clip(new_log, self._lo, self._hi)
+      self.log_val.write(new_log)
+      log_v = new_log
+    return jnp.exp(log_v)
 
 
 def lambda_return(last, term, rew, val, boot, disc, lam):
