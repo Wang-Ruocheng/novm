@@ -390,6 +390,7 @@ def imag_loss(
     lam=0.95,
     actent=3e-4,
     slowreg=1.0,
+    min_rand=0.0,
 ):
   losses = {}
   metrics = {}
@@ -410,8 +411,18 @@ def imag_loss(
   adv_normed = (adv - aoffset) / ascale
   logpi = sum([v.logp(sg(act[k]))[:, :-1] for k, v in policy.items()])
   ents = {k: v.entropy()[:, :-1] for k, v in policy.items()}
+  # Entropy floor gate: when rand < min_rand, block the policy gradient so only
+  # the actent*H term remains.  A collapsed policy (rand→0) has H≈0 too, so the
+  # entropy gradient vanishes and the collapse is stable — the gate breaks this by
+  # ensuring actent*H is the *only* gradient until entropy recovers.
+  pol_gate = f32(1.0)
+  if min_rand > 0.0:
+    for k, v in policy.items():
+      if hasattr(v, 'minent') and hasattr(v, 'maxent'):
+        cur_rand = sg((ents[k].mean() - v.minent) / (v.maxent - v.minent + 1e-8))
+        pol_gate = jnp.minimum(pol_gate, (cur_rand >= min_rand).astype(f32))
   policy_loss = sg(weight[:, :-1]) * -(
-      logpi * sg(adv_normed) + actent * sum(ents.values()))
+      pol_gate * logpi * sg(adv_normed) + actent * sum(ents.values()))
   losses['policy'] = policy_loss
 
   voffset, vscale = valnorm(ret, update)
@@ -435,6 +446,7 @@ def imag_loss(
   metrics['ret_min'] = ret_normed.min()
   metrics['ret_max'] = ret_normed.max()
   metrics['ret_rate'] = (jnp.abs(ret_normed) >= 1.0).mean()
+  metrics['pol_gate'] = pol_gate
   for k in act:
     metrics[f'ent/{k}'] = ents[k].mean()
     if hasattr(policy[k], 'minent'):
