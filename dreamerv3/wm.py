@@ -303,7 +303,8 @@ class NOWM(nj.Module):
       stoch = jnp.zeros([bsize, self.stoch, self.classes], f32)
     return nn.cast(dict(
         deter=jnp.zeros([bsize, self._total()], f32),
-        stoch=stoch))
+        stoch=stoch,
+        tokens_prev=jnp.zeros([bsize, self._sp()], f32)))
 
   def truncate(self, entries, carry=None):
     assert entries['deter'].ndim == 3, entries['deter'].shape
@@ -327,14 +328,22 @@ class NOWM(nj.Module):
       return carry, entries, feat
 
   def _observe(self, carry, tokens, action, reset, training):
-    deter, stoch, action = nn.mask(
-        (carry['deter'], carry['stoch'], action), ~reset)
+    deter, stoch, action, tokens_prev = nn.mask(
+        (carry['deter'], carry['stoch'], action, carry['tokens_prev']), ~reset)
     action = nn.DictConcat(self.act_space, 1)(action)
     action = nn.mask(action, ~reset)
     deter = self._core(deter, stoch, action)
     tokens = tokens.reshape((*deter.shape[:-1], -1))
+
+    # Velocity: project enc tokens to lat_chan dims, diff with previous step
+    B = tokens.shape[0]; H = W = self.lat_size; C = self.lat_chan
+    C_enc = tokens.shape[-1] // (H * W)
+    tokens_proj = self.sub('vel_tok_proj', nn.Linear, C, **self.kw)(
+        tokens.reshape(B, H * W, C_enc))                       # (B, HW, C)
+    vel = tokens_proj - tokens_prev.reshape(B, H * W, C)       # (B, HW, C)
+
     deter_prior = deter                              # prior deter: no observation info
-    deter = self._spatial_observe(deter, tokens)    # update h_spatial per-location
+    deter = self._spatial_observe(deter, tokens, vel)  # update h_spatial per-location
     deter = self._vec_observe(deter, tokens)        # update h_vec from global pool
     # obslogit uses deter_posterior so assim ops get gradient via KL(rep) and
     # reconstruction (straight-through stoch).  feat/carry stay on deter_prior so
@@ -355,21 +364,24 @@ class NOWM(nj.Module):
       # logit already (B, H, W, stoch, classes) from _obs_logit_spatial / _spatial_logit
     # carry/feat: deter_prior forces decoder to rely on stoch for obs info (no KL collapse).
     # entry:      deter_posterior for imagination starts (spatially-corrected state).
-    carry = dict(deter=deter_prior, stoch=stoch)
+    carry = dict(deter=deter_prior, stoch=stoch,
+                 tokens_prev=tokens_proj.reshape(B, -1))
     feat = dict(deter=deter_prior, prior_deter=deter_prior, stoch=stoch, logit=logit)
     entry = dict(deter=deter, stoch=stoch)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
 
-  def _spatial_observe(self, deter, tokens):
+  def _spatial_observe(self, deter, tokens, vel):
     """Spatial assimilation: h_spatial updated by obs-conditioned spatial operator.
 
     Mirrors _core's dynamics step, but conditioned on observations instead of action:
-      h_s_post = gated(h_s_prior, O_assim(h_s_prior + enc_inject, ctx_obs))
+      h_s_post = gated(h_s_prior, O_assim(h_s_prior + enc_inject + vel_inject, ctx_obs))
 
     Two paths for observation info:
       1. Per-location additive injection: enc_tok[i,j] added to h_s[i,j] before operator
       2. FiLM conditioning: pooled enc + h_v → ctx_obs modulates operator output
+    Velocity injection (vel): per-location delta of projected enc tokens across timesteps,
+    letting the model encode ball/paddle direction directly in h_spatial.
 
     Uses the same spatial_op as the dynamics step (prefix='assim' → independent weights),
     giving the assimilation full global receptive field (e.g. FNO spectral mixing).
@@ -388,6 +400,8 @@ class NOWM(nj.Module):
 
     # Per-location injection: align encoder field with latent field (local detail)
     h_s_in = h_s_tok + self.sub('assim_enc_inj', nn.Linear, C, **self.kw)(enc_tok)
+    # Velocity injection: per-location change in projected enc tokens → direction/speed
+    h_s_in = h_s_in + self.sub('assim_vel_inj', nn.Linear, C, **self.kw)(vel)
     h_s_in = self.sub('assim_in_norm', nn.Norm, self.norm)(h_s_in)
 
     # Observation context: global enc summary + h_v → conditions assimilation operator
@@ -452,6 +466,7 @@ class NOWM(nj.Module):
     return jnp.concatenate([deter[:, :sp], h_v_post], axis=-1)
 
   def imagine(self, carry, policy, length, training, single=False):
+    carry = {k: carry[k] for k in ('deter', 'stoch')}  # strip velocity state
     if single:
       action = policy(sg(carry)) if callable(policy) else policy
       actemb = nn.DictConcat(self.act_space, 1)(action)
@@ -583,7 +598,7 @@ class NOWM(nj.Module):
   def _prior(self, feat):
     if self.stoch_spatial:
       H = W = self.lat_size; C = self.lat_chan; sp = self._sp()
-      h_s_tok = feat[..., :sp].reshape(*feat.shape[:-1], H * W, C)  # (..., HW, C)
+      h_s_tok = feat[..., :sp].reshape((*feat.shape[:-1], H * W, C))  # (..., HW, C)
       h_v = feat[..., sp:]                                           # (..., D)
       x = h_s_tok
       for i in range(self.imglayers):
@@ -615,7 +630,7 @@ class NOWM(nj.Module):
     kw = dict(**self.kw, outscale=self.outscale)
     x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x)  # (..., HW, stoch*cls)
     *lead, HW, _ = x.shape
-    return x.reshape(*lead, H, W, self.stoch, self.classes)
+    return x.reshape((*lead, H, W, self.stoch, self.classes))
 
   def _obs_logit_spatial(self, deter, tokens):
     """Spatial posterior: per-location obslogit from posterior deter + encoder tokens.
@@ -793,7 +808,7 @@ class NOWM(nj.Module):
   def _dist(self, logits):
     if logits.ndim >= 5:  # spatial: (..., H, W, stoch, classes)
       *lead, H, W, S, C = logits.shape
-      logits = logits.reshape(*lead, H * W * S, C)
+      logits = logits.reshape((*lead, H * W * S, C))
     out = embodied.jax.outs.OneHot(logits, self.unimix)
     out = embodied.jax.outs.Agg(out, 1, jnp.sum)
     return out
@@ -803,6 +818,6 @@ class NOWM(nj.Module):
     def _prep(logits):
       if logits.ndim >= 5:
         *lead, H, W, S, C = logits.shape
-        logits = logits.reshape(*lead, H * W * S, C)
+        logits = logits.reshape((*lead, H * W * S, C))
       return embodied.jax.outs.OneHot(logits, self.unimix)
     return _prep(post_logits).kl(_prep(prior_logits))

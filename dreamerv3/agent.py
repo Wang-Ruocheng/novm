@@ -188,7 +188,13 @@ class Agent(embodied.jax.Agent):
       space, value = self.obs_space[key], obs[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
       target = f32(value) / 255 if isimage(space) else value
-      losses[key] = recon.loss(sg(target))
+      if isimage(space) and self.config.change_scale > 0:
+        raw = f32(value)
+        raw_prev = jnp.concatenate([raw[:, :1], raw[:, :-1]], axis=1)
+        delta = jnp.abs(raw - raw_prev).mean(axis=(-3, -2, -1)) / 255.0  # (B,T)
+        losses[key] = (1.0 + self.config.change_scale * delta) * recon.loss(sg(target))
+      else:
+        losses[key] = recon.loss(sg(target))
 
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
