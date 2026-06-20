@@ -308,7 +308,14 @@ class NOWM(nj.Module):
 
   def truncate(self, entries, carry=None):
     assert entries['deter'].ndim == 3, entries['deter'].shape
-    return jax.tree.map(lambda x: x[:, -1], entries)
+    result = jax.tree.map(lambda x: x[:, -1], entries)
+    # tokens_prev is not stored in entries; restore from carry or default to zeros
+    if carry is not None and 'tokens_prev' in carry:
+      result['tokens_prev'] = carry['tokens_prev']
+    else:
+      B = result['deter'].shape[0]
+      result['tokens_prev'] = jnp.zeros([B, self._sp()], result['deter'].dtype)
+    return result
 
   def starts(self, entries, carry, nlast):
     B = len(jax.tree.leaves(carry)[0])
