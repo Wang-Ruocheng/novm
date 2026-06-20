@@ -406,7 +406,12 @@ class NOWM(nj.Module):
     enc_tok = tokens.reshape(B, H * W, C_enc)     # (B, HW, C_enc)
 
     # Per-location injection: align encoder field with latent field (local detail)
-    h_s_in = h_s_tok + self.sub('assim_enc_inj', nn.Linear, C, **self.kw)(enc_tok)
+    # For attnno, RoPE handles position — no additive sinusoidal PE needed.
+    if self.spatial_op != 'attnno':
+      pe = self._pos2d(H, W, C).astype(h_s_tok.dtype)
+      h_s_in = (h_s_tok + pe) + self.sub('assim_enc_inj', nn.Linear, C, **self.kw)(enc_tok) + pe
+    else:
+      h_s_in = h_s_tok + self.sub('assim_enc_inj', nn.Linear, C, **self.kw)(enc_tok)
     # Velocity injection: per-location change in projected enc tokens → direction/speed
     h_s_in = h_s_in + self.sub('assim_vel_inj', nn.Linear, C, **self.kw)(vel)
     h_s_in = self.sub('assim_in_norm', nn.Norm, self.norm)(h_s_in)
@@ -541,6 +546,9 @@ class NOWM(nj.Module):
         self.sub('op_ctx_norm', nn.Norm, self.norm)(act_emb + h_v_emb))  # (B, C)
 
     # ---- Spatial operator: conditioned on ctx inside WNO subbands ----
+    # For attnno, RoPE handles position internally — skip additive PE here.
+    if self.spatial_op != 'attnno':
+      h_s_tok_norm = h_s_tok_norm + self._pos2d(H, W, C).astype(h_s_tok_norm.dtype)
     h_s_mixed = self._spatial_op(h_s_tok_norm, B, H, W, C, deter.dtype, ctx)
 
     # Stochastic forcing: per-location (spatial) or broadcast (global)
@@ -683,6 +691,8 @@ class NOWM(nj.Module):
       out = self._conv_op(h_s_tok, B, H, W, C, prefix)
     elif self.spatial_op == 'wno':
       return self._wno_op(h_s_tok, B, H, W, C, ctx, prefix)
+    elif self.spatial_op == 'attnno':
+      return self._attn_no_op(h_s_tok, B, H, W, C, ctx, prefix)
     else:
       raise ValueError(f'Unknown spatial_op: {self.spatial_op!r}')
     film = self.sub(f'{prefix}_ctx_film', nn.Linear, 2 * C, **self.kw)(ctx)
@@ -798,6 +808,102 @@ class NOWM(nj.Module):
     out = self.sub(f'{prefix}_proj', nn.Linear, C, **self.kw)(out)
     return h_s_tok + out                                            # residual
 
+  def _rope2d(self, q, k, H, W):
+    """2D Rotary Position Embedding applied to Q and K.
+
+    Splits head_dim into two halves: first half encodes row, second half col.
+    Non-interleaved (GPT-NeoX) convention: rotate_half([a,b]) = [−b, a].
+    The dot product qᵢ·kⱼ then depends only on (row_i−row_j, col_i−col_j),
+    not absolute coordinates — better suited for translation-invariant dynamics.
+    Falls back silently when dh < 4 or dh % 4 ≠ 0 (e.g. debug configs).
+    """
+    dh = q.shape[-1]
+    if dh < 4 or dh % 4 != 0:
+      return q, k
+    d_half = dh // 2        # dims per spatial direction
+    d_pair = d_half // 2    # independent frequency bands per direction
+    freq = 1.0 / (10000.0 ** (jnp.arange(d_pair, dtype=jnp.float32) /
+                               max(d_pair - 1, 1)))
+    theta_row = jnp.outer(jnp.arange(H, dtype=jnp.float32), freq)   # (H, d_pair)
+    theta_col = jnp.outer(jnp.arange(W, dtype=jnp.float32), freq)   # (W, d_pair)
+    theta_row = jnp.broadcast_to(theta_row[:, None, :], (H, W, d_pair)).reshape(H * W, d_pair)
+    theta_col = jnp.broadcast_to(theta_col[None, :, :], (H, W, d_pair)).reshape(H * W, d_pair)
+    cos_r = jnp.tile(jnp.cos(theta_row), 2)    # (N, d_half) — non-interleaved
+    sin_r = jnp.tile(jnp.sin(theta_row), 2)
+    cos_c = jnp.tile(jnp.cos(theta_col), 2)
+    sin_c = jnp.tile(jnp.sin(theta_col), 2)
+    cos = jnp.concatenate([cos_r, cos_c], -1)   # (N, dh) float32
+    sin = jnp.concatenate([sin_r, sin_c], -1)
+
+    def rotate_half(x):
+      xr, xc = x[..., :d_half], x[..., d_half:]
+      def rh(t):
+        t1, t2 = t[..., :d_pair], t[..., d_pair:]
+        return jnp.concatenate([-t2, t1], -1)
+      return jnp.concatenate([rh(xr), rh(xc)], -1)
+
+    cos4 = cos[None, None].astype(jnp.float32)   # (1, 1, N, dh)
+    sin4 = sin[None, None].astype(jnp.float32)
+    q_f, k_f = q.astype(jnp.float32), k.astype(jnp.float32)
+    return q_f * cos4 + rotate_half(q_f) * sin4, k_f * cos4 + rotate_half(k_f) * sin4
+
+  def _attn_no_op(self, h_s_tok, B, H, W, C, ctx, prefix='dyn'):
+    """Transformer NO: 2D RoPE + QK-Norm + ctx-token conditioning.
+
+    Three improvements over plain _attn_op:
+      1. QK-Norm (RMSNorm on Q/K after projection): bounds attention logit growth,
+         prevents entropy collapse, stabilises early training.
+      2. 2D RoPE on Q/K: encodes relative spatial position (Δrow, Δcol) via
+         rotation — better than additive PE for translation-invariant dynamics.
+      3. ctx as extra K/V token: action+state is a full token all spatial positions
+         can attend to, more expressive than a scalar logit bias.
+    Handles ctx internally; _spatial_op must NOT apply a second FiLM.
+    """
+    heads = self.attn_heads
+    dh = max(1, C // heads)
+    N = H * W
+
+    # Pre-norm; no additive PE — RoPE handles position inside attention
+    x = self.sub(f'{prefix}_no_norm', nn.Norm, self.norm)(h_s_tok)   # (B, N, C)
+
+    q = self.sub(f'{prefix}_no_q', nn.Linear, heads * dh, **self.kw)(x)
+    k = self.sub(f'{prefix}_no_k', nn.Linear, heads * dh, **self.kw)(x)
+    v = self.sub(f'{prefix}_no_v', nn.Linear, heads * dh, **self.kw)(x)
+
+    # QK-Norm: prevents attention logit explosion from growing Q/K norms
+    q = self.sub(f'{prefix}_no_qnorm', nn.Norm, self.norm)(q)
+    k = self.sub(f'{prefix}_no_knorm', nn.Norm, self.norm)(k)
+
+    def split_heads(t):
+      return t.reshape(B, N, heads, dh).transpose(0, 2, 1, 3)   # (B, heads, N, dh)
+    q, k, v = split_heads(q), split_heads(k), split_heads(v)
+
+    # 2D RoPE encodes relative position into Q/K
+    q, k = self._rope2d(q, k, H, W)
+    q, k = q.astype(h_s_tok.dtype), k.astype(h_s_tok.dtype)
+
+    # ctx token: all spatial positions can attend to the action/state context
+    ctx_k = self.sub(f'{prefix}_no_ctx_k', nn.Linear, heads * dh, **self.kw)(ctx)
+    ctx_v = self.sub(f'{prefix}_no_ctx_v', nn.Linear, heads * dh, **self.kw)(ctx)
+    ctx_k = ctx_k.reshape(B, 1, heads, dh).transpose(0, 2, 1, 3)   # (B, heads, 1, dh)
+    ctx_v = ctx_v.reshape(B, 1, heads, dh).transpose(0, 2, 1, 3)
+    k_full = jnp.concatenate([k, ctx_k], axis=2)    # (B, heads, N+1, dh)
+    v_full = jnp.concatenate([v, ctx_v], axis=2)
+
+    logits = jnp.einsum('bhid,bhjd->bhij', q, k_full).astype(jnp.float32) * (dh ** -0.5)
+    attn = jax.nn.softmax(logits, axis=-1).astype(h_s_tok.dtype)    # (B, heads, N, N+1)
+    out = jnp.einsum('bhij,bhjd->bhid', attn, v_full)               # (B, heads, N, dh)
+    out = out.transpose(0, 2, 1, 3).reshape(B, N, heads * dh)
+    out = self.sub(f'{prefix}_no_proj', nn.Linear, C, **self.kw)(out)
+
+    out = h_s_tok + out   # residual
+
+    # Lightweight output FiLM catches residual ctx signal
+    film = self.sub(f'{prefix}_no_film', nn.Linear, 2 * C, **self.kw)(ctx)
+    γ, β = jnp.split(film, 2, axis=-1)
+    γ = jax.nn.sigmoid(γ) * 2
+    return γ[:, None, :] * out + β[:, None, :]
+
   def _conv_op(self, h_s_tok, B, H, W, C, prefix='dyn'):
     """3×3 local convolution via im2col + linear (zero-padded borders).
 
@@ -819,6 +925,28 @@ class NOWM(nj.Module):
     out = embodied.jax.outs.OneHot(logits, self.unimix)
     out = embodied.jax.outs.Agg(out, 1, jnp.sum)
     return out
+
+  def _pos2d(self, H, W, C):
+    """Fixed 2D sinusoidal position embedding, shape (H*W, C).
+
+    Splits C evenly into 4 groups: sin(row), cos(row), sin(col), cos(col).
+    No learnable parameters — acts as a stable positional prior so the spatial
+    operator and assimilation cross-attention don't need to discover alignment
+    from data.  Added to h_s_tok before WNO and before assimilation.
+    """
+    assert C % 4 == 0, f'lat_chan={C} must be divisible by 4 for 2D sinusoidal PE'
+    d = C // 4
+    freq = 1.0 / (10000 ** (jnp.arange(d, dtype=jnp.float32) / max(d - 1, 1)))
+    rows = jnp.arange(H, dtype=jnp.float32)
+    cols = jnp.arange(W, dtype=jnp.float32)
+    row_enc = jnp.outer(rows, freq)                                  # (H, d)
+    col_enc = jnp.outer(cols, freq)                                  # (W, d)
+    row_pe = jnp.concatenate([jnp.sin(row_enc), jnp.cos(row_enc)], -1)  # (H, 2d)
+    col_pe = jnp.concatenate([jnp.sin(col_enc), jnp.cos(col_enc)], -1)  # (W, 2d)
+    row_pe = jnp.broadcast_to(row_pe[:, None, :], (H, W, 2 * d))
+    col_pe = jnp.broadcast_to(col_pe[None, :, :], (H, W, 2 * d))
+    pe = jnp.concatenate([row_pe, col_pe], -1)                      # (H, W, C)
+    return pe.reshape(H * W, C)                                      # (HW, C)
 
   def _kl_per_var(self, post_logits, prior_logits):
     """Per-variable KL (..., N) before summing — for correct per-location free_nats floor."""

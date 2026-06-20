@@ -92,7 +92,7 @@ defaults:
     ac_grads: False
     dyn:
       typ: nowm
-      nowm: {deter: 256, hidden: 256, stoch: 1, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, free_nats: 0.001, absolute: False, lat_size: 8, lat_chan: 32, spatial_op: wno, attn_heads: 2, fno_modes: 4, stoch_spatial: True}
+      nowm: {deter: 256, hidden: 256, stoch: 1, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, free_nats: 0.001, absolute: False, lat_size: 8, lat_chan: 32, spatial_op: attnno, attn_heads: 2, fno_modes: 4, stoch_spatial: True}
     enc:
       typ: simple
       simple: {depth: 32, mults: [2, 3, 4], layers: 3, units: 1024, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
