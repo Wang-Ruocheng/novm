@@ -106,7 +106,7 @@ defaults:
     imag_length: 15
     horizon: 333
     contdisc: True
-    imag_loss: {slowtar: False, lam: 0.95, actent: 3e-4, slowreg: 1.0, min_rand: 0.0, target_rand: 0.0, actent_rate: 3e-5}
+    imag_loss: {slowtar: False, lam: 0.95, actent: 1e-3, slowreg: 1.0, min_rand: 0.1, target_rand: 0.0, actent_rate: 3e-5}
     repl_loss: {slowtar: False, lam: 0.95, slowreg: 1.0}
     slowvalue: {rate: 0.02, every: 1}
     retnorm: {impl: perc, rate: 0.01, limit: 1.0, perclo: 5.0, perchi: 95.0, debias: False}
