@@ -21,7 +21,7 @@ defaults:
 
   logger:
     outputs: [jsonl, scope]
-    filter: 'score|length|fps|ratio|train/loss/|train/rand/|train/pol_gate|train/actent|train/debug_min_rand'
+    filter: 'score|length|fps|ratio|train/loss/|train/rand/|train/pol_gate|train/actent|train/debug_min_rand|train/phase'
     timer: True
     fps: 15
     user: ''
@@ -86,6 +86,8 @@ defaults:
   agent:
     loss_scales: {rec: 0.1, rew: 2.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3}
     change_scale: 5.0
+    phase1_steps: 300000
+    phase1_ramp: 20000
     opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
     ac_grads: False
     dyn:

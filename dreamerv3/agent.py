@@ -82,6 +82,13 @@ class Agent(embodied.jax.Agent):
           rate=config.imag_loss.get('actent_rate', 3e-4),
           name='actent_adapt')
 
+    self.phase_sched = None
+    if config.get('phase1_steps', 0) > 0:
+      self.phase_sched = PhaseScheduler(
+          phase1_steps=config.phase1_steps,
+          ramp_steps=config.get('phase1_ramp', 20000),
+          name='phase_sched')
+
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
@@ -253,7 +260,17 @@ class Agent(embodied.jax.Agent):
     assert set(losses.keys()) == set(self.scales.keys()), (
         sorted(losses.keys()), sorted(self.scales.keys()))
     metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
-    loss = sum([v.mean() * self.scales[k] for k, v in losses.items()])
+
+    # Two-phase training: ramp policy/value/repval scales from 0 → full.
+    policy_mult = f32(1.0)
+    if self.phase_sched is not None:
+      policy_mult = self.phase_sched(update=training)
+      metrics['phase/policy_mult'] = policy_mult
+    policy_keys = frozenset(('policy', 'value', 'repval'))
+    loss = sum([
+        v.mean() * (self.scales[k] * policy_mult if k in policy_keys
+                    else self.scales[k])
+        for k, v in losses.items()])
 
     carry = (enc_carry, dyn_carry, dec_carry)
     entries = (enc_entries, dyn_entries, dec_entries)
@@ -520,6 +537,27 @@ def repl_loss(
   metrics = {}
 
   return losses, outs, metrics
+
+
+class PhaseScheduler(nj.Module):
+  """Two-phase training schedule: ramp policy/value scales from 0 to 1.
+
+  For the first `phase1_steps` gradient steps the multiplier is 0 (world-model
+  only training).  Over the following `ramp_steps` it increases linearly to 1.
+  The step counter lives in ninjax state so it survives checkpoints.
+  """
+
+  def __init__(self, phase1_steps, ramp_steps):
+    self._phase1 = float(phase1_steps)
+    self._ramp = float(max(ramp_steps, 1))
+    self._step = nj.Variable(
+        lambda s, d: jnp.zeros(s, d), (), jnp.float32, name='step')
+
+  def __call__(self, update=True):
+    step = self._step.read()
+    if update:
+      self._step.write(step + 1.0)
+    return jnp.clip((step - self._phase1) / self._ramp, 0.0, 1.0)
 
 
 class ActentAdaptor(nj.Module):
