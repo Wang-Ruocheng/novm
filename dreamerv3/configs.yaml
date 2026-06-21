@@ -174,10 +174,16 @@ procgen:
 atari100k:
   task: atari100k_pong
   run: {steps: 1.1e5, envs: 1, train_ratio: 256}
+  agent:
+    phase1_steps: 3000    # 300k × (32/256) = 37.5k → 保守取3k，约12%训练预算
+    phase1_ramp: 500
 
 crafter:
   task: crafter_reward
   run: {steps: 1.1e6, envs: 1, train_ratio: 512}
+  agent:
+    phase1_steps: 7000    # 300k × (32/512) = 18.75k → 保守取7k
+    phase1_ramp: 1000
 
 dmc_proprio:
   <<: *size1m
