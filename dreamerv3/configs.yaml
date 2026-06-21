@@ -21,7 +21,7 @@ defaults:
 
   logger:
     outputs: [jsonl, scope]
-    filter: 'score|length|fps|ratio|train/loss/|train/rand/|train/pol_gate|train/actent|train/debug_min_rand|train/phase'
+    filter: 'score|length|fps|ratio|train/loss/|train/rand/|train/pol_gate|train/actent|train/debug_min_rand|train/phase|train/rew$|train/val$|train/adv'
     timer: True
     fps: 15
     user: ''
@@ -175,8 +175,9 @@ atari100k:
   task: atari100k_pong
   run: {steps: 1.1e5, envs: 1, train_ratio: 256}
   agent:
-    phase1_steps: 3000    # 300k × (32/256) = 37.5k → 保守取3k，约12%训练预算
-    phase1_ramp: 500
+    phase1_steps: 10000   # ~40k env steps (40% budget), WM见到足够多帧再训策略
+    phase1_ramp: 1000
+    imag_loss: {slowtar: True, actent: 3e-3}
 
 crafter:
   task: crafter_reward
