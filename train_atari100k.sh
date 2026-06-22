@@ -8,7 +8,7 @@
 
 set -e
 
-LOGROOT="${LOGROOT:-$HOME/logdir/nowm_atari100k}"
+LOGROOT="${LOGROOT:-logs/pong_nowm_v9}"
 GPU="${GPU:-0}"
 SEED="${SEED:-0}"
 
