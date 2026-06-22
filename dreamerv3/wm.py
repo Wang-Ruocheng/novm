@@ -349,26 +349,25 @@ class NOWM(nj.Module):
         tokens.reshape(B, H * W, C_enc))                       # (B, HW, C)
     vel = tokens_proj - tokens_prev.reshape(B, H * W, C)       # (B, HW, C)
 
-    deter_prior = deter                              # prior deter: no observation info
-    deter = self._spatial_observe(deter, tokens, vel)  # update h_spatial per-location
-    deter = self._vec_observe(deter, tokens)        # update h_vec from global pool
-    # obslogit uses deter_posterior so assim ops get gradient via KL(rep) and
-    # reconstruction (straight-through stoch).  feat/carry stay on deter_prior so
-    # the decoder cannot bypass assimilation to read obs directly (dynamics bypass).
-    # For deterministic games, KL will collapse to free_nats floor; that is expected.
+    deter_prior = deter
     if self.stoch_spatial:
-      logit = self._obs_logit_spatial(deter, tokens)
+      # Bottleneck: posterior computed from prior deter + enc_tok only.
+      # h_spatial is then updated from stoch_post (not enc_tok directly),
+      # forcing all observation info through the stochastic bottleneck.
+      logit = self._obs_logit_spatial(deter_prior, tokens)
+      stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+      stoch = stoch.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
+      deter = self._spatial_observe(deter_prior, tokens, vel, stoch_inject=stoch)
+      deter = self._vec_observe(deter, tokens)
     else:
+      deter = self._spatial_observe(deter_prior, tokens, vel)
+      deter = self._vec_observe(deter, tokens)
       x = tokens if self.absolute else jnp.concatenate([deter, tokens], -1)
       for i in range(self.obslayers):
         x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
         x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
       logit = self._logit('obslogit', x)
-    stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
-    if self.stoch_spatial:
-      B = deter_prior.shape[0]
-      stoch = stoch.reshape(B, self.lat_size, self.lat_size, self.stoch, self.classes)
-      # logit already (B, H, W, stoch, classes) from _obs_logit_spatial / _spatial_logit
+      stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
     # carry/feat: deter_prior forces decoder to rely on stoch for obs info (no KL collapse).
     # entry:      deter_posterior for imagination starts (spatially-corrected state).
     carry = dict(deter=deter_prior, stoch=stoch,
@@ -378,20 +377,21 @@ class NOWM(nj.Module):
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
 
-  def _spatial_observe(self, deter, tokens, vel):
+  def _spatial_observe(self, deter, tokens, vel, stoch_inject=None):
     """Spatial assimilation: h_spatial updated by obs-conditioned spatial operator.
 
-    Mirrors _core's dynamics step, but conditioned on observations instead of action:
-      h_s_post = gated(h_s_prior, O_assim(h_s_prior + enc_inject + vel_inject, ctx_obs))
+    stoch_inject: (B, H, W, stoch, classes) — bottleneck mode.
+      When provided, h_spatial is updated from stoch_post (not enc_tok directly),
+      forcing all observation info to flow through the stochastic bottleneck.
+      enc_tok is blocked from the injection path; only vel (motion delta) is kept.
+      ctx uses h_v only (no enc_global), consistent with the bottleneck constraint.
 
-    Two paths for observation info:
-      1. Per-location additive injection: enc_tok[i,j] added to h_s[i,j] before operator
-      2. FiLM conditioning: pooled enc + h_v → ctx_obs modulates operator output
-    Velocity injection (vel): per-location delta of projected enc tokens across timesteps,
-    letting the model encode ball/paddle direction directly in h_spatial.
+    stoch_inject=None — direct mode (global stoch or non-spatial cases).
+      enc_tok injected per-location; enc_global+h_v conditions the operator.
 
-    Uses the same spatial_op as the dynamics step (prefix='assim' → independent weights),
-    giving the assimilation full global receptive field (e.g. FNO spectral mixing).
+    In both modes, vel (per-location enc delta across timesteps) is injected as a
+    motion signal — it encodes direction/speed rather than absolute appearance,
+    so it does not create an enc_tok bypass.
     """
     H = W = self.lat_size
     C = self.lat_chan
@@ -405,26 +405,30 @@ class NOWM(nj.Module):
     C_enc = tokens.shape[-1] // (H * W)
     enc_tok = tokens.reshape(B, H * W, C_enc)     # (B, HW, C_enc)
 
-    # Per-location injection: align encoder field with latent field (local detail)
-    # For attnno, RoPE handles position — no additive sinusoidal PE needed.
-    if self.spatial_op != 'attnno':
-      pe = self._pos2d(H, W, C).astype(h_s_tok.dtype)
-      h_s_in = (h_s_tok + pe) + self.sub('assim_enc_inj', nn.Linear, C, **self.kw)(enc_tok) + pe
+    if stoch_inject is not None:
+      # Bottleneck: inject stoch_post instead of enc_tok
+      stoch_flat = stoch_inject.reshape(B, H * W, self.stoch * self.classes)
+      h_s_in = h_s_tok + self.sub('assim_stoch_inj', nn.Linear, C, **self.kw)(stoch_flat)
+      obs_ctx = nn.act(self.act)(
+          self.sub('assim_ctx_norm', nn.Norm, self.norm)(
+              self.sub('assim_ctx_s', nn.Linear, C, **self.kw)(h_v)))
     else:
-      h_s_in = h_s_tok + self.sub('assim_enc_inj', nn.Linear, C, **self.kw)(enc_tok)
+      # Direct: inject enc_tok per-location
+      if self.spatial_op != 'attnno':
+        pe = self._pos2d(H, W, C).astype(h_s_tok.dtype)
+        h_s_in = (h_s_tok + pe) + self.sub('assim_enc_inj', nn.Linear, C, **self.kw)(enc_tok) + pe
+      else:
+        h_s_in = h_s_tok + self.sub('assim_enc_inj', nn.Linear, C, **self.kw)(enc_tok)
+      enc_global = enc_tok.mean(axis=1)
+      obs_ctx = nn.act(self.act)(
+          self.sub('assim_ctx_norm', nn.Norm, self.norm)(
+              self.sub('assim_ctx', nn.Linear, C, **self.kw)(
+                  jnp.concatenate([enc_global, h_v], axis=-1))))
+
     # Velocity injection: per-location change in projected enc tokens → direction/speed
     h_s_in = h_s_in + self.sub('assim_vel_inj', nn.Linear, C, **self.kw)(vel)
     h_s_in = self.sub('assim_in_norm', nn.Norm, self.norm)(h_s_in)
 
-    # Observation context: global enc summary + h_v → conditions assimilation operator
-    enc_global = enc_tok.mean(axis=1)              # (B, C_enc) — global summary
-    obs_ctx = nn.act(self.act)(
-        self.sub('assim_ctx_norm', nn.Norm, self.norm)(
-            self.sub('assim_ctx', nn.Linear, C, **self.kw)(
-                jnp.concatenate([enc_global, h_v], axis=-1))))  # (B, C)
-
-    # Assimilation operator: uses the same spatial op as dynamics (prefix='assim')
-    # obs_ctx conditions the operator via FiLM inside _spatial_op.
     h_s_cand = self._spatial_op(h_s_in, B, H, W, C, h_s_in.dtype, obs_ctx, prefix='assim')
 
     # Gated update (bias=-1 → near-identity at init)
@@ -648,11 +652,12 @@ class NOWM(nj.Module):
     return x.reshape((*lead, H, W, self.stoch, self.classes))
 
   def _obs_logit_spatial(self, deter, tokens):
-    """Spatial posterior: per-location obslogit from posterior deter + encoder tokens.
+    """Spatial posterior: per-location obslogit from prior deter + encoder tokens.
 
-    Receives deter_posterior (after assimilation ops) so KL/reconstruction gradients
-    flow back through _spatial_observe and _vec_observe.
-    """
+    Receives deter_prior (before assimilation) so the posterior is computed from
+    the dynamics prediction + observation, without enc_tok contamination in deter.
+    KL/reconstruction gradients flow back through tokens and deter_prior → _core.
+"""
     H = W = self.lat_size; C = self.lat_chan; sp = self._sp()
     B = deter.shape[0]
     h_s_tok = deter[:, :sp].reshape(B, H * W, C)               # (B, HW, C)
