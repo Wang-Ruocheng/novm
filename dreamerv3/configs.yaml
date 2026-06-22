@@ -186,7 +186,7 @@ atari100k:
     dyn:
       nowm: {lat_size: 4, lat_chan: 16, spatial_op: fno, stoch_spatial: False}
     dec:
-      simple: {spatial_dec: True, lat_size: 4, lat_chan: 16, bspace: 4}
+      simple: {spatial_dec: True, lat_size: 4, lat_chan: 16, bspace: 4, mults: [1, 2, 3, 4]}
 
 crafter:
   task: crafter_reward
