@@ -870,13 +870,16 @@ class NOWM(nj.Module):
     k = self.sub(f'{prefix}_no_k', nn.Linear, heads * dh, **self.kw)(x)
     v = self.sub(f'{prefix}_no_v', nn.Linear, heads * dh, **self.kw)(x)
 
-    # QK-Norm: prevents attention logit explosion from growing Q/K norms
-    q = self.sub(f'{prefix}_no_qnorm', nn.Norm, self.norm)(q)
-    k = self.sub(f'{prefix}_no_knorm', nn.Norm, self.norm)(k)
-
     def split_heads(t):
       return t.reshape(B, N, heads, dh).transpose(0, 2, 1, 3)   # (B, heads, N, dh)
     q, k, v = split_heads(q), split_heads(k), split_heads(v)
+
+    # QK-Norm per head (after split): normalise over dh so each head has unit RMS,
+    # matching the dh**-0.5 scaling in logits.  Must come after split_heads.
+    q = self.sub(f'{prefix}_no_qnorm', nn.Norm, self.norm)(
+        q.reshape(B * heads, N, dh)).reshape(B, heads, N, dh)
+    k = self.sub(f'{prefix}_no_knorm', nn.Norm, self.norm)(
+        k.reshape(B * heads, N, dh)).reshape(B, heads, N, dh)
 
     # 2D RoPE encodes relative position into Q/K
     q, k = self._rope2d(q, k, H, W)
@@ -885,6 +888,9 @@ class NOWM(nj.Module):
     # ctx token: all spatial positions can attend to the action/state context
     ctx_k = self.sub(f'{prefix}_no_ctx_k', nn.Linear, heads * dh, **self.kw)(ctx)
     ctx_v = self.sub(f'{prefix}_no_ctx_v', nn.Linear, heads * dh, **self.kw)(ctx)
+    # QK-Norm on ctx_k so it stays on the same scale as the normalised spatial keys
+    ctx_k = self.sub(f'{prefix}_no_ctx_knorm', nn.Norm, self.norm)(
+        ctx_k.reshape(B, heads, dh)).reshape(B, heads, dh)
     ctx_k = ctx_k.reshape(B, 1, heads, dh).transpose(0, 2, 1, 3)   # (B, heads, 1, dh)
     ctx_v = ctx_v.reshape(B, 1, heads, dh).transpose(0, 2, 1, 3)
     k_full = jnp.concatenate([k, ctx_k], axis=2)    # (B, heads, N+1, dh)
