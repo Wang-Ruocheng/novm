@@ -171,6 +171,11 @@ procgen:
   task: procgen_coinrun
   run: {steps: 1.1e8, train_ratio: 64}
 
+nowm:
+  agent:
+    dyn:
+      typ: nowm
+
 atari100k:
   task: atari100k_pong
   run: {steps: 1.1e5, envs: 1, train_ratio: 256}
