@@ -512,11 +512,11 @@ class NOWM(nj.Module):
     post = feat['logit']
     dyn_kl = self._kl_per_var(sg(post), prior)   # (..., N)
     rep_kl = self._kl_per_var(post, sg(prior))   # (..., N)
-    if self.free_nats:
-      dyn_kl = jnp.maximum(dyn_kl, self.free_nats)
-      rep_kl = jnp.maximum(rep_kl, self.free_nats)
     dyn = dyn_kl.sum(-1)
     rep = rep_kl.sum(-1)
+    if self.free_nats:
+      dyn = jnp.maximum(dyn, self.free_nats)
+      rep = jnp.maximum(rep, self.free_nats)
     losses = {'dyn': dyn, 'rep': rep}
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
