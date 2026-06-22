@@ -40,7 +40,7 @@ for game in "${GAMES[@]}"; do
     --seed "$SEED" \
     --logdir "$LOGROOT/${game}_s${SEED}" \
     --jax.platform cuda \
-    "$@"
+    "${@:2}"
   echo "=== Done: $game ==="
 done
 
