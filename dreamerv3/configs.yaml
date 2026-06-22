@@ -180,11 +180,13 @@ atari100k:
   task: atari100k_pong
   run: {steps: 1.1e5, envs: 1, train_ratio: 256}
   agent:
-    phase1_steps: 1000    # 4k env steps = 4% budget，仅作 WM 热身
+    phase1_steps: 1000
     phase1_ramp: 200
-    imag_loss: {slowtar: True, actent: 3e-3, target_rand: 0.3, actent_rate: 3e-4}
+    imag_loss: {slowtar: True, actent: 3e-4, target_rand: 0.3, actent_rate: 3e-4}
     dyn:
-      nowm: {lat_size: 4, lat_chan: 16, spatial_op: fno, stoch_spatial: False}
+      nowm: {lat_size: 4, lat_chan: 16, spatial_op: fno, stoch_spatial: False, stoch: 8}
+    enc:
+      simple: {mults: [2, 3, 4, 4]}
     dec:
       simple: {spatial_dec: True, lat_size: 4, lat_chan: 16, bspace: 4, mults: [1, 2, 3, 4]}
 
