@@ -8,10 +8,10 @@
 
 set -e
 
-LOGROOT="${LOGROOT:-logs/pong_nowm_v10}"
+LOGROOT="${LOGROOT:-logs/pong_nowm_v11}"
 GPU="${GPU:-0}"
 SEED="${SEED:-0}"
-STEPS="${STEPS:-2.2e5}"
+STEPS="${STEPS:-1.1e5}"
 
 ALL_GAMES=(
   alien amidar assault asterix bank_heist battle_zone boxing breakout
