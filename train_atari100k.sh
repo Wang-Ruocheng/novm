@@ -8,9 +8,10 @@
 
 set -e
 
-LOGROOT="${LOGROOT:-logs/pong_nowm_v9}"
+LOGROOT="${LOGROOT:-logs/pong_nowm_v10}"
 GPU="${GPU:-0}"
 SEED="${SEED:-0}"
+STEPS="${STEPS:-2.2e5}"
 
 ALL_GAMES=(
   alien amidar assault asterix bank_heist battle_zone boxing breakout
@@ -39,6 +40,7 @@ for game in "${GAMES[@]}"; do
     --task "atari100k_${game}" \
     --seed "$SEED" \
     --logdir "$LOGROOT/${game}_s${SEED}" \
+    --run.steps "$STEPS" \
     --jax.platform cuda \
     "${@:2}"
   echo "=== Done: $game ==="
