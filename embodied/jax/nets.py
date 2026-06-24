@@ -365,10 +365,12 @@ class Norm(nj.Module):
   scale: bool = True
   shift: bool = True
 
-  def __init__(self, impl):
+  def __init__(self, impl, axis=None):
     if '1em' in impl:
       impl, exp = impl.split('1em')
       self._fields['eps'] = 10 ** -int(exp)
+    if axis is not None:
+      self._fields['axis'] = tuple(axis)
     self.impl = impl
 
   def __call__(self, x):

@@ -539,7 +539,7 @@ class NOWM(nj.Module):
     h_s = deter[:, :sp].reshape(B, H, W, C)   # (B, H, W, C)
     h_v = deter[:, sp:]                         # (B, D)
     h_s_tok = h_s.reshape(B, H * W, C)          # (B, HW, C) original — kept for identity path
-    h_s_tok_norm = self.sub('mix_norm_s', nn.Norm, self.norm)(h_s_tok)  # normalized — for operator input
+    h_s_tok_norm = self.sub('mix_norm_s', nn.Norm, self.norm)(h_s_tok)
 
     # ---- Context embedding: action + global state ----
     # Both action and h_vec condition the spatial operator INSIDE WNO (per-subband FiLM).
@@ -585,11 +585,12 @@ class NOWM(nj.Module):
     # h_vec acts as query: it actively selects which spatial locations are relevant
     # (e.g. "health low" → attend to nearby hazards), rather than blind mean+max.
     h_s_tok_new = h_s_new.reshape(B, H * W, C)
+    h_s_tok_new_fn = self.sub('s2g_fn', nn.Norm, self.norm)(h_s_tok_new)
     heads = self.attn_heads; dh = max(1, C // heads)
     q_s2g = self.sub('s2g_q', nn.Linear, heads * dh, **self.kw)(h_v).reshape(B, heads, dh)
-    k_s2g = (self.sub('s2g_k', nn.Linear, heads * dh, **self.kw)(h_s_tok_new)
+    k_s2g = (self.sub('s2g_k', nn.Linear, heads * dh, **self.kw)(h_s_tok_new_fn)
              .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
-    v_s2g = (self.sub('s2g_v', nn.Linear, heads * dh, **self.kw)(h_s_tok_new)
+    v_s2g = (self.sub('s2g_v', nn.Linear, heads * dh, **self.kw)(h_s_tok_new_fn)
              .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
     attn_s2g = jax.nn.softmax(
         jnp.einsum('bhd,bhnd->bhn', q_s2g, k_s2g) * (dh ** -0.5), axis=-1)
