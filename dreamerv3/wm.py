@@ -585,12 +585,11 @@ class NOWM(nj.Module):
     # h_vec acts as query: it actively selects which spatial locations are relevant
     # (e.g. "health low" → attend to nearby hazards), rather than blind mean+max.
     h_s_tok_new = h_s_new.reshape(B, H * W, C)
-    h_s_tok_new_fn = self.sub('s2g_fn', nn.Norm, self.norm)(h_s_tok_new)
     heads = self.attn_heads; dh = max(1, C // heads)
     q_s2g = self.sub('s2g_q', nn.Linear, heads * dh, **self.kw)(h_v).reshape(B, heads, dh)
-    k_s2g = (self.sub('s2g_k', nn.Linear, heads * dh, **self.kw)(h_s_tok_new_fn)
+    k_s2g = (self.sub('s2g_k', nn.Linear, heads * dh, **self.kw)(h_s_tok_new)
              .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
-    v_s2g = (self.sub('s2g_v', nn.Linear, heads * dh, **self.kw)(h_s_tok_new_fn)
+    v_s2g = (self.sub('s2g_v', nn.Linear, heads * dh, **self.kw)(h_s_tok_new)
              .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
     attn_s2g = jax.nn.softmax(
         jnp.einsum('bhd,bhnd->bhn', q_s2g, k_s2g) * (dh ** -0.5), axis=-1)
