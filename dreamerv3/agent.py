@@ -457,16 +457,19 @@ def imag_loss(
     avg_rand = sg(sum(rands) / len(rands)) if rands else f32(0.5)
     actent = actent_adapt(avg_rand, update)
 
-  # Entropy floor gate: when rand < min_rand, block the policy gradient so only
-  # the actent*H term remains.  A collapsed policy (rand→0) has H≈0 too, so the
-  # entropy gradient vanishes and the collapse is stable — the gate breaks this by
-  # ensuring actent*H is the *only* gradient until entropy recovers.
+  # Soft entropy gate: linearly ramp down the policy gradient as rand falls
+  # below min_rand.  pol_gate = clip(rand / min_rand, 0, 1), so at rand=0 the
+  # policy gradient is fully blocked and at rand=min_rand it is fully open.
+  # This avoids the hard-gate deadlock where pol_gate=0 also zeroed out any
+  # residual entropy gradient through actent*H (which is near zero when the
+  # policy has collapsed), causing the policy to freeze permanently.
   pol_gate = f32(1.0)
   if min_rand > 0.0:
     for k, v in policy.items():
       if hasattr(v, 'minent') and hasattr(v, 'maxent'):
         gate_rand = sg((ents[k].mean() - v.minent) / (v.maxent - v.minent + 1e-8))
-        pol_gate = jnp.minimum(pol_gate, (gate_rand >= min_rand).astype(f32))
+        pol_gate = jnp.minimum(
+            pol_gate, jnp.clip(gate_rand / (min_rand + 1e-8), 0.0, 1.0))
   policy_loss = sg(weight[:, :-1]) * -(
       pol_gate * logpi * sg(adv_normed) + actent * sum(ents.values()))
   losses['policy'] = policy_loss
