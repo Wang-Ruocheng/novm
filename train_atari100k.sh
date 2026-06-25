@@ -8,7 +8,7 @@
 
 set -e
 
-LOGROOT="${LOGROOT:-logs/pong_nowm_v17}"
+LOGROOT="${LOGROOT:-logs/pong_nowm_v18}"
 GPU="${GPU:-0}"
 SEED="${SEED:-0}"
 STEPS="${STEPS:-1.1e5}"
