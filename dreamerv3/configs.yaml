@@ -187,7 +187,7 @@ atari100k:
     dyn:
       nowm: {lat_size: 8, lat_chan: 32, spatial_op: attnno, attn_heads: 8, stoch: 32, classes: 64, stoch_spatial: False, deter: 512}
     enc:
-      simple: {depth: 64, mults: [2, 3, 4]}
+      simple: {depth: 32, mults: [1, 1, 1]}
     dec:
       simple: {depth: 64, spatial_dec: True, lat_size: 8, lat_chan: 32, bspace: 8, mults: [2, 3, 4]}
 
