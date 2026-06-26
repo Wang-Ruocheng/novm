@@ -265,6 +265,7 @@ class NOWM(nj.Module):
   attn_heads: int = 4        # used when spatial_op='attn'
   fno_modes: int = 4         # used when spatial_op='fno'
   op_layers: int = 1         # number of stacked spatial operator blocks
+  use_vel: bool = True       # inject per-location velocity (enc_tok delta) in assimilation
   # Spatial stochastic latent field: each location gets its own stoch variables.
   # Enables per-location posterior and per-location stochastic PDE forcing.
   # stoch_total = lat_size^2 * stoch; stoch/classes are now per-location counts.
@@ -427,7 +428,8 @@ class NOWM(nj.Module):
                   jnp.concatenate([enc_global, h_v], axis=-1))))
 
     # Velocity injection: per-location change in projected enc tokens → direction/speed
-    h_s_in = h_s_in + self.sub('assim_vel_inj', nn.Linear, C, **self.kw)(vel)
+    if self.use_vel:
+      h_s_in = h_s_in + self.sub('assim_vel_inj', nn.Linear, C, **self.kw)(vel)
     h_s_in = self.sub('assim_in_norm', nn.Norm, self.norm)(h_s_in)
 
     h_s_cand = self._spatial_op(h_s_in, B, H, W, C, h_s_in.dtype, obs_ctx, prefix='assim')
