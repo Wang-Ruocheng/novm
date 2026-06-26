@@ -49,21 +49,12 @@ class Agent(embodied.jax.Agent):
     }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
 
     if config.dyn.typ == 'nowm':
-      # NOWM: policy/value only see h_v (global state) + stoch representation.
+      # NOWM: policy/value only see h_v (global state) + stoch one-hot.
       # h_v already aggregates spatial info via s2g attention in _core.
-      # Use softmax(logit) when available (loss computation on imgfeat — dense,
-      # informative); fall back to one-hot stoch during imagination action selection
-      # (carry only has {deter, stoch}, logit is not yet computed).
       _sp = config.dyn.nowm.lat_size ** 2 * config.dyn.nowm.lat_chan
-      def _nowm_feat2tensor(x):
-        h_v = nn.cast(x['deter'])[..., _sp:]
-        if 'logit' in x:
-          stoch_rep = jax.nn.softmax(nn.cast(x['logit']), axis=-1)
-        else:
-          stoch_rep = nn.cast(x['stoch'])
-        return jnp.concatenate(
-            [h_v, stoch_rep.reshape(x['deter'].shape[:-1] + (-1,))], -1)
-      self.feat2tensor = _nowm_feat2tensor
+      self.feat2tensor = lambda x: jnp.concatenate([
+          nn.cast(x['deter'])[..., _sp:],
+          nn.cast(x['stoch']).reshape(x['deter'].shape[:-1] + (-1,))], -1)
     else:
       self.feat2tensor = lambda x: jnp.concatenate([
           nn.cast(x['deter']),
