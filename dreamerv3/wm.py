@@ -633,7 +633,11 @@ class NOWM(nj.Module):
         x = nn.act(self.act)(γ[..., None, :] * x + β[..., None, :])
       return self._spatial_logit('priorlogit', x)
     else:
-      x = feat
+      # stoch_spatial=False: global stoch predicted from h_v only.
+      # h_v (deter[sp:]) already aggregates spatial field via s2g attention in _core,
+      # so feeding the full h_s_flat (2048 dims) adds noise without extra signal.
+      sp = self._sp()
+      x = feat[..., sp:]                                        # h_v only (D dims)
       for i in range(self.imglayers):
         x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
         x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
