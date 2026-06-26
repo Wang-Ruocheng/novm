@@ -907,7 +907,14 @@ class NOWM(nj.Module):
     out = out.transpose(0, 2, 1, 3).reshape(B, N, heads * dh)
     out = self.sub(f'{prefix}_no_proj', nn.Linear, C, **self.kw)(out)
 
-    out = h_s_tok + out   # residual
+    out = h_s_tok + out   # attention residual
+
+    # FFN sublayer: pre-norm → 2× expand → act → project → residual
+    ffn = self.sub(f'{prefix}_no_ffn_norm', nn.Norm, self.norm)(out)
+    ffn = self.sub(f'{prefix}_no_ffn1', nn.Linear, 2 * C, **self.kw)(ffn)
+    ffn = nn.act(self.act)(ffn)
+    ffn = self.sub(f'{prefix}_no_ffn2', nn.Linear, C, **self.kw)(ffn)
+    out = out + ffn
 
     # Lightweight output FiLM catches residual ctx signal
     film = self.sub(f'{prefix}_no_film', nn.Linear, 2 * C, **self.kw)(ctx)

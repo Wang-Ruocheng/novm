@@ -4,6 +4,8 @@ A world model for model-based reinforcement learning that formalises environment
 dynamics as a **PDE on a spatial latent field**, solved by a learned Neural
 Operator. Evaluated on the Atari 100k benchmark.
 
+Built on the [DreamerV3](https://github.com/danijar/dreamerv3) codebase (Hafner et al., 2025), which provides the training infrastructure, agent loop, and environment wrappers.
+
 ---
 
 ## Motivation

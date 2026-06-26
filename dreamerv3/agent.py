@@ -48,9 +48,18 @@ class Agent(embodied.jax.Agent):
         'simple': wm.Decoder,
     }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
 
-    self.feat2tensor = lambda x: jnp.concatenate([
-        nn.cast(x['deter']),
-        nn.cast(x['stoch']).reshape(x['deter'].shape[:-1] + (-1,))], -1)
+    if config.dyn.typ == 'nowm':
+      # NOWM: policy/value only see h_v (global state) + stoch, not raw h_s_flat.
+      # h_v already aggregates spatial info via s2g attention in _core; feeding the
+      # full h_s_flat (2048 dims) adds noise and makes the MLP input unnecessarily wide.
+      _sp = config.dyn.nowm.lat_size ** 2 * config.dyn.nowm.lat_chan
+      self.feat2tensor = lambda x: jnp.concatenate([
+          nn.cast(x['deter'])[..., _sp:],   # h_v only  (D dims)
+          nn.cast(x['stoch']).reshape(x['deter'].shape[:-1] + (-1,))], -1)
+    else:
+      self.feat2tensor = lambda x: jnp.concatenate([
+          nn.cast(x['deter']),
+          nn.cast(x['stoch']).reshape(x['deter'].shape[:-1] + (-1,))], -1)
 
     scalar = elements.Space(np.float32, ())
     binary = elements.Space(bool, (), 0, 2)
