@@ -264,6 +264,7 @@ class NOWM(nj.Module):
   spatial_op: str = 'attn'
   attn_heads: int = 4        # used when spatial_op='attn'
   fno_modes: int = 4         # used when spatial_op='fno'
+  op_layers: int = 1         # number of stacked spatial operator blocks
   # Spatial stochastic latent field: each location gets its own stoch variables.
   # Enables per-location posterior and per-location stochastic PDE forcing.
   # stoch_total = lat_size^2 * stoch; stoch/classes are now per-location counts.
@@ -697,7 +698,10 @@ class NOWM(nj.Module):
     elif self.spatial_op == 'wno':
       return self._wno_op(h_s_tok, B, H, W, C, ctx, prefix)
     elif self.spatial_op == 'attnno':
-      return self._attn_no_op(h_s_tok, B, H, W, C, ctx, prefix)
+      x = h_s_tok
+      for i in range(self.op_layers):
+        x = self._attn_no_op(x, B, H, W, C, ctx, f'{prefix}_{i}')
+      return x
     else:
       raise ValueError(f'Unknown spatial_op: {self.spatial_op!r}')
     film = self.sub(f'{prefix}_ctx_film', nn.Linear, 2 * C, **self.kw)(ctx)
