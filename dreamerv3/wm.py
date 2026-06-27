@@ -266,6 +266,7 @@ class NOWM(nj.Module):
   fno_modes: int = 4         # used when spatial_op='fno'
   op_layers: int = 1         # number of stacked spatial operator blocks
   use_vel: bool = True       # inject per-location velocity (enc_tok delta) in assimilation
+  use_cls: bool = True       # replace s2g with CLS token in AttnNO
   # Spatial stochastic latent field: each location gets its own stoch variables.
   # Enables per-location posterior and per-location stochastic PDE forcing.
   # stoch_total = lat_size^2 * stoch; stoch/classes are now per-location counts.
@@ -556,7 +557,17 @@ class NOWM(nj.Module):
     # For attnno, RoPE handles position internally — skip additive PE here.
     if self.spatial_op != 'attnno':
       h_s_tok_norm = h_s_tok_norm + self._pos2d(H, W, C).astype(h_s_tok_norm.dtype)
-    h_s_mixed = self._spatial_op(h_s_tok_norm, B, H, W, C, deter.dtype, ctx)
+
+    use_cls_path = self.use_cls and self.spatial_op == 'attnno'
+
+    if use_cls_path:
+      # Initialize CLS token from h_v: project 512→C (lat_chan) dims
+      cls_init = self.sub('cls_down', nn.Linear, C, **self.kw)(h_v)         # (B, C)
+      cls_init = self.sub('cls_down_norm', nn.Norm, self.norm)(cls_init)
+      h_s_mixed, cls_new = self._spatial_op(
+          h_s_tok_norm, B, H, W, C, deter.dtype, ctx, cls_tok=cls_init)
+    else:
+      h_s_mixed = self._spatial_op(h_s_tok_norm, B, H, W, C, deter.dtype, ctx)
 
     # Stochastic forcing: per-location (spatial) or broadcast (global)
     # Spatial: η(x,t) per location — stochastic PDE noise field
@@ -584,21 +595,32 @@ class NOWM(nj.Module):
         gate_s * jnp.tanh(cand_s_tok) + (1 - gate_s) * h_s_tok
     ).reshape(B, H, W, C)
 
-    # ---- Spatial → global: h_vec-conditioned attention pooling ----
-    # h_vec acts as query: it actively selects which spatial locations are relevant
-    # (e.g. "health low" → attend to nearby hazards), rather than blind mean+max.
-    h_s_tok_new = h_s_new.reshape(B, H * W, C)
-    heads = self.attn_heads; dh = max(1, C // heads)
-    q_s2g = self.sub('s2g_q', nn.Linear, heads * dh, **self.kw)(h_v).reshape(B, heads, dh)
-    k_s2g = (self.sub('s2g_k', nn.Linear, heads * dh, **self.kw)(h_s_tok_new)
-             .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
-    v_s2g = (self.sub('s2g_v', nn.Linear, heads * dh, **self.kw)(h_s_tok_new)
-             .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
-    attn_s2g = jax.nn.softmax(
-        jnp.einsum('bhd,bhnd->bhn', q_s2g, k_s2g) * (dh ** -0.5), axis=-1)
-    s2g = jnp.einsum('bhn,bhnd->bhd', attn_s2g, v_s2g).reshape(B, heads * dh)
-    s2g = self.sub('s2g_proj', nn.Linear, self.hidden, **self.kw)(s2g)
-    s2g = nn.act(self.act)(self.sub('s2g_norm', nn.Norm, self.norm)(s2g))
+    if use_cls_path:
+      # ---- CLS-based spatial → global summary (replaces s2g attention) ----
+      # Gated combination of initial CLS and attended CLS output
+      cls_gate = jax.nn.sigmoid(
+          self.sub('cls_gate', nn.Linear, C, **self.kw)(
+              jnp.concatenate([cls_init, cls_new], -1)) - 1)
+      cls_gated = cls_gate * jnp.tanh(cls_new) + (1 - cls_gate) * cls_init   # (B, C)
+      # Project CLS up to hidden dim to serve as spatial summary for GRU
+      s2g = self.sub('cls_up', nn.Linear, self.hidden, **self.kw)(cls_gated)  # (B, hidden)
+      s2g = nn.act(self.act)(self.sub('cls_up_norm', nn.Norm, self.norm)(s2g))
+    else:
+      # ---- Spatial → global: h_vec-conditioned attention pooling (fallback) ----
+      # h_vec acts as query: it actively selects which spatial locations are relevant
+      # (e.g. "health low" → attend to nearby hazards), rather than blind mean+max.
+      h_s_tok_new = h_s_new.reshape(B, H * W, C)
+      heads = self.attn_heads; dh = max(1, C // heads)
+      q_s2g = self.sub('s2g_q', nn.Linear, heads * dh, **self.kw)(h_v).reshape(B, heads, dh)
+      k_s2g = (self.sub('s2g_k', nn.Linear, heads * dh, **self.kw)(h_s_tok_new)
+               .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
+      v_s2g = (self.sub('s2g_v', nn.Linear, heads * dh, **self.kw)(h_s_tok_new)
+               .reshape(B, H * W, heads, dh).transpose(0, 2, 1, 3))
+      attn_s2g = jax.nn.softmax(
+          jnp.einsum('bhd,bhnd->bhn', q_s2g, k_s2g) * (dh ** -0.5), axis=-1)
+      s2g = jnp.einsum('bhn,bhnd->bhd', attn_s2g, v_s2g).reshape(B, heads * dh)
+      s2g = self.sub('s2g_proj', nn.Linear, self.hidden, **self.kw)(s2g)
+      s2g = nn.act(self.act)(self.sub('s2g_norm', nn.Norm, self.norm)(s2g))
 
     # ---- GRU update for h_vec ----
     # Spatial stoch is (B, H*W*stoch*classes): project to hidden before concat
@@ -688,12 +710,16 @@ class NOWM(nj.Module):
     return self._spatial_logit('obslogit', x)                   # (B, H, W, stoch, classes)
 
 
-  def _spatial_op(self, h_s_tok, B, H, W, C, compute_dtype, ctx, prefix='dyn'):
+  def _spatial_op(self, h_s_tok, B, H, W, C, compute_dtype, ctx, prefix='dyn', cls_tok=None):
     """Dispatch to the selected spatial operator. Returns (B, HW, C).
 
     prefix distinguishes dynamics weights ('dyn') from assimilation weights ('assim'),
     allowing the same operator structure to be reused with independent parameters.
     fno/attn/conv use FiLM conditioning on ctx; wno handles its own per-subband FiLM.
+
+    When cls_tok (B, C) is provided and spatial_op == 'attnno', it is threaded through
+    each layer so that CLS and spatial tokens attend to each other. Returns (x, cls) in
+    that case. Otherwise returns x only (backward-compatible).
     """
     if self.spatial_op == 'fno':
       out = self._fno_op(h_s_tok, B, H, W, C, compute_dtype, prefix)
@@ -705,8 +731,14 @@ class NOWM(nj.Module):
       return self._wno_op(h_s_tok, B, H, W, C, ctx, prefix)
     elif self.spatial_op == 'attnno':
       x = h_s_tok
+      cls = cls_tok
       for i in range(self.op_layers):
-        x = self._attn_no_op(x, B, H, W, C, ctx, f'{prefix}_{i}')
+        if cls is not None:
+          x, cls = self._attn_no_op(x, B, H, W, C, ctx, f'{prefix}_{i}', cls_tok=cls)
+        else:
+          x = self._attn_no_op(x, B, H, W, C, ctx, f'{prefix}_{i}')
+      if cls is not None:
+        return x, cls
       return x
     else:
       raise ValueError(f'Unknown spatial_op: {self.spatial_op!r}')
@@ -862,7 +894,7 @@ class NOWM(nj.Module):
     q_f, k_f = q.astype(jnp.float32), k.astype(jnp.float32)
     return q_f * cos4 + rotate_half(q_f) * sin4, k_f * cos4 + rotate_half(k_f) * sin4
 
-  def _attn_no_op(self, h_s_tok, B, H, W, C, ctx, prefix='dyn'):
+  def _attn_no_op(self, h_s_tok, B, H, W, C, ctx, prefix='dyn', cls_tok=None):
     """Transformer NO: 2D RoPE + QK-Norm + ctx-token conditioning.
 
     Three improvements over plain _attn_op:
@@ -873,32 +905,55 @@ class NOWM(nj.Module):
       3. ctx as extra K/V token: action+state is a full token all spatial positions
          can attend to, more expressive than a scalar logit bias.
     Handles ctx internally; _spatial_op must NOT apply a second FiLM.
+
+    When cls_tok (B, C) is provided, it is prepended to the token sequence so that
+    global state and spatial tokens attend to each other jointly. 2D RoPE is applied
+    only to the spatial tokens (positions 1..N); the CLS token (position 0) has no
+    positional encoding. Returns (h_s_out, cls_out) when cls_tok is not None,
+    otherwise returns h_s_out alone (backward-compatible).
     """
     heads = self.attn_heads
     dh = max(1, C // heads)
     N = H * W
 
+    # Optionally prepend CLS token to form the full token sequence
+    if cls_tok is not None:
+      tokens_in = jnp.concatenate([cls_tok[:, None, :], h_s_tok], axis=1)  # (B, 1+N, C)
+    else:
+      tokens_in = h_s_tok                                                    # (B, N, C)
+    N_full = tokens_in.shape[1]   # 1+N when CLS, else N
+
     # Pre-norm; no additive PE — RoPE handles position inside attention
-    x = self.sub(f'{prefix}_no_norm', nn.Norm, self.norm)(h_s_tok)   # (B, N, C)
+    x = self.sub(f'{prefix}_no_norm', nn.Norm, self.norm)(tokens_in)   # (B, N_full, C)
 
     q = self.sub(f'{prefix}_no_q', nn.Linear, heads * dh, **self.kw)(x)
     k = self.sub(f'{prefix}_no_k', nn.Linear, heads * dh, **self.kw)(x)
     v = self.sub(f'{prefix}_no_v', nn.Linear, heads * dh, **self.kw)(x)
 
     def split_heads(t):
-      return t.reshape(B, N, heads, dh).transpose(0, 2, 1, 3)   # (B, heads, N, dh)
+      return t.reshape(B, N_full, heads, dh).transpose(0, 2, 1, 3)   # (B, heads, N_full, dh)
     q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
     # QK-Norm per head (after split): normalise over dh so each head has unit RMS,
     # matching the dh**-0.5 scaling in logits.  Must come after split_heads.
     q = self.sub(f'{prefix}_no_qnorm', nn.Norm, self.norm)(
-        q.reshape(B * heads, N, dh)).reshape(B, heads, N, dh)
+        q.reshape(B * heads, N_full, dh)).reshape(B, heads, N_full, dh)
     k = self.sub(f'{prefix}_no_knorm', nn.Norm, self.norm)(
-        k.reshape(B * heads, N, dh)).reshape(B, heads, N, dh)
+        k.reshape(B * heads, N_full, dh)).reshape(B, heads, N_full, dh)
 
-    # 2D RoPE encodes relative position into Q/K
-    q, k = self._rope2d(q, k, H, W)
-    q, k = q.astype(h_s_tok.dtype), k.astype(h_s_tok.dtype)
+    # 2D RoPE encodes relative position into Q/K for spatial tokens only.
+    # CLS token (position 0) gets no positional encoding.
+    if cls_tok is not None:
+      q_cls, q_spat = q[:, :, :1, :], q[:, :, 1:, :]   # (B, heads, 1, dh), (B, heads, N, dh)
+      k_cls, k_spat = k[:, :, :1, :], k[:, :, 1:, :]
+      q_spat, k_spat = self._rope2d(q_spat, k_spat, H, W)
+      q_spat = q_spat.astype(h_s_tok.dtype)
+      k_spat = k_spat.astype(h_s_tok.dtype)
+      q = jnp.concatenate([q_cls, q_spat], axis=2)      # (B, heads, 1+N, dh)
+      k = jnp.concatenate([k_cls, k_spat], axis=2)
+    else:
+      q, k = self._rope2d(q, k, H, W)
+      q, k = q.astype(h_s_tok.dtype), k.astype(h_s_tok.dtype)
 
     # ctx token: all spatial positions can attend to the action/state context
     ctx_k = self.sub(f'{prefix}_no_ctx_k', nn.Linear, heads * dh, **self.kw)(ctx)
@@ -908,16 +963,16 @@ class NOWM(nj.Module):
         ctx_k.reshape(B, heads, dh)).reshape(B, heads, dh)
     ctx_k = ctx_k.reshape(B, 1, heads, dh).transpose(0, 2, 1, 3)   # (B, heads, 1, dh)
     ctx_v = ctx_v.reshape(B, 1, heads, dh).transpose(0, 2, 1, 3)
-    k_full = jnp.concatenate([k, ctx_k], axis=2)    # (B, heads, N+1, dh)
+    k_full = jnp.concatenate([k, ctx_k], axis=2)    # (B, heads, N_full+1, dh)
     v_full = jnp.concatenate([v, ctx_v], axis=2)
 
     logits = jnp.einsum('bhid,bhjd->bhij', q, k_full).astype(jnp.float32) * (dh ** -0.5)
-    attn = jax.nn.softmax(logits, axis=-1).astype(h_s_tok.dtype)    # (B, heads, N, N+1)
-    out = jnp.einsum('bhij,bhjd->bhid', attn, v_full)               # (B, heads, N, dh)
-    out = out.transpose(0, 2, 1, 3).reshape(B, N, heads * dh)
+    attn = jax.nn.softmax(logits, axis=-1).astype(tokens_in.dtype)    # (B, heads, N_full, N_full+1)
+    out = jnp.einsum('bhij,bhjd->bhid', attn, v_full)                 # (B, heads, N_full, dh)
+    out = out.transpose(0, 2, 1, 3).reshape(B, N_full, heads * dh)
     out = self.sub(f'{prefix}_no_proj', nn.Linear, C, **self.kw)(out)
 
-    out = h_s_tok + out   # attention residual
+    out = tokens_in + out   # attention residual
 
     # FFN sublayer: pre-norm → 2× expand → act → project → residual
     ffn = self.sub(f'{prefix}_no_ffn_norm', nn.Norm, self.norm)(out)
@@ -930,7 +985,12 @@ class NOWM(nj.Module):
     film = self.sub(f'{prefix}_no_film', nn.Linear, 2 * C, **self.kw)(ctx)
     γ, β = jnp.split(film, 2, axis=-1)
     γ = jax.nn.sigmoid(γ) * 2
-    return γ[:, None, :] * out + β[:, None, :]
+    out = γ[:, None, :] * out + β[:, None, :]
+
+    # Return (spatial_tokens, cls_token) when CLS was provided, else just spatial tokens
+    if cls_tok is not None:
+      return out[:, 1:, :], out[:, 0, :]   # (B, N, C), (B, C)
+    return out
 
   def _conv_op(self, h_s_tok, B, H, W, C, prefix='dyn'):
     """3×3 local convolution via im2col + linear (zero-padded borders).
