@@ -540,7 +540,7 @@ class NOWM(nj.Module):
     if k > 0 and T > k:
       acts_flat = nn.cast(nn.DictConcat(self.act_space, 1)(acts))  # (B, T, act_dim)
       pred_deter = nn.cast(entries['deter'][:, :T - k])            # (B, T-k, sp+D)
-      pred_stoch = nn.cast(entries['stoch'][:, :T - k])            # (B, T-k, stoch, cls)
+      pred_stoch = sg(nn.cast(entries['stoch'][:, :T - k]))        # (B, T-k, stoch, cls) sg: stoch serves as noise input only
       for step in range(k):
         act_step = acts_flat[:, step + 1: T - k + step + 1]        # (B, T-k, act_dim)
         bt = B * (T - k)
