@@ -173,6 +173,8 @@ procgen:
   run: {steps: 1.1e8, train_ratio: 64}
 
 nowm:
+  env:
+    atari: {size: [64, 64]}
   agent:
     dyn:
       typ: nowm
