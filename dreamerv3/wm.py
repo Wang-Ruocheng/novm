@@ -311,16 +311,16 @@ class NOWM(nj.Module):
           [bsize, self.lat_size, self.lat_size, self.stoch, self.classes], f32)
     else:
       stoch = jnp.zeros([bsize, self.stoch, self.classes], f32)
-    carry = nn.cast(dict(
+    carry = dict(
         deter=jnp.zeros([bsize, self._total()], f32),
         stoch=stoch,
-        tokens_prev=jnp.zeros([bsize, self._sp()], f32)))
+        tokens_prev=jnp.zeros([bsize, self._sp()], f32))
     if self.map_size > 0:
       init_p = (self.map_size - self.lat_size) // 2
       carry['w_s'] = jnp.zeros(
           [bsize, self.map_size, self.map_size, self.lat_chan], f32)
       carry['pose'] = jnp.full([bsize, 2], init_p, jnp.int32)
-    return carry
+    return nn.cast(carry)
 
   def truncate(self, entries, carry=None):
     assert entries['deter'].ndim == 3, entries['deter'].shape
