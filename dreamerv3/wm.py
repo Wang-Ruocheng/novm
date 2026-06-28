@@ -263,7 +263,7 @@ class NOWM(nj.Module):
   # Spatial operator: 'fno' | 'attn' | 'conv'
   spatial_op: str = 'attn'
   attn_heads: int = 4        # used when spatial_op='attn'
-  fno_modes: int = 4         # used when spatial_op='fno'
+  fno_modes: int = 4         # only used when spatial_op='fno'; inactive with attnno
   op_layers: int = 1         # number of stacked spatial operator blocks
   use_vel: bool = True       # inject per-location velocity (enc_tok delta) in assimilation
   use_cls: bool = True       # replace s2g with CLS token in AttnNO
@@ -346,12 +346,21 @@ class NOWM(nj.Module):
     deter = self._core(deter, stoch, action)
     tokens = tokens.reshape((*deter.shape[:-1], -1))
 
-    # Velocity: project enc tokens to lat_chan dims, diff with previous step
+    # Velocity signal: per-location enc-token delta across timesteps.
+    # Only projected/diffed when use_vel=True; carry shape is kept consistent
+    # regardless so checkpoints remain compatible if use_vel is toggled.
+    # NOTE: incompatible with frame-level aug_shift — enable only when all
+    # frames in a sequence share the same shift (or aug is disabled).
     B = tokens.shape[0]; H = W = self.lat_size; C = self.lat_chan
     C_enc = tokens.shape[-1] // (H * W)
-    tokens_proj = self.sub('vel_tok_proj', nn.Linear, C, **self.kw)(
-        tokens.reshape(B, H * W, C_enc))                       # (B, HW, C)
-    vel = tokens_proj - tokens_prev.reshape(B, H * W, C)       # (B, HW, C)
+    if self.use_vel:
+      tokens_proj = self.sub('vel_tok_proj', nn.Linear, C, **self.kw)(
+          tokens.reshape(B, H * W, C_enc))                     # (B, HW, C)
+      vel = tokens_proj - tokens_prev.reshape(B, H * W, C)     # (B, HW, C)
+      tokens_prev_new = tokens_proj.reshape(B, -1)
+    else:
+      vel = jnp.zeros((B, H * W, C), tokens.dtype)
+      tokens_prev_new = tokens_prev                             # carry unchanged
 
     deter_prior = deter
     if self.stoch_spatial:
@@ -375,7 +384,7 @@ class NOWM(nj.Module):
     # carry/feat: deter_prior forces decoder to rely on stoch for obs info (no KL collapse).
     # entry:      deter_posterior for imagination starts (spatially-corrected state).
     carry = dict(deter=deter_prior, stoch=stoch,
-                 tokens_prev=tokens_proj.reshape(B, -1))
+                 tokens_prev=tokens_prev_new)
     feat = dict(deter=deter_prior, prior_deter=deter_prior, stoch=stoch, logit=logit)
     entry = dict(deter=deter, stoch=stoch)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
@@ -749,6 +758,7 @@ class NOWM(nj.Module):
     each layer so that CLS and spatial tokens attend to each other. Returns (x, cls) in
     that case. Otherwise returns x only (backward-compatible).
     """
+    # Alternative operators (inactive in default atari100k config; kept for ablations).
     if self.spatial_op == 'fno':
       out = self._fno_op(h_s_tok, B, H, W, C, compute_dtype, prefix)
     elif self.spatial_op == 'attn':
