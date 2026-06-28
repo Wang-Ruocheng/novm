@@ -176,6 +176,23 @@ class Agent(embodied.jax.Agent):
     carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, outs, metrics
 
+  @staticmethod
+  def _random_shift(obs, pad):
+    """BBF-style random shift augmentation: pad by `pad` pixels, random crop back."""
+    if 'image' not in obs:
+      return obs
+    img = obs['image']                                        # (B, T, H, W, C) uint8
+    B, T, H, W, C = img.shape
+    padded = jnp.pad(img, [(0,0),(0,0),(pad,pad),(pad,pad),(0,0)], mode='edge')
+    bt = B * T
+    flat = padded.reshape(bt, H + 2 * pad, W + 2 * pad, C)
+    h_off = jax.random.randint(nj.seed(), (bt,), 0, 2 * pad)
+    w_off = jax.random.randint(nj.seed(), (bt,), 0, 2 * pad)
+    cropped = jax.vmap(
+        lambda im, h, w: jax.lax.dynamic_slice(im, (h, w, 0), (H, W, C))
+    )(flat, h_off, w_off)
+    return {**obs, 'image': cropped.reshape(B, T, H, W, C)}
+
   def loss(self, carry, obs, prevact, training):
     enc_carry, dyn_carry, dec_carry = carry
     reset = obs['is_first']
@@ -183,9 +200,16 @@ class Agent(embodied.jax.Agent):
     losses = {}
     metrics = {}
 
+    # Random shift augmentation (BBF): augment encoder input only.
+    # Keep original obs for reconstruction targets and change_scale to avoid
+    # per-frame random shifts creating spurious temporal deltas.
+    enc_obs = obs
+    if training and self.config.aug_shift > 0:
+      enc_obs = self._random_shift(obs, self.config.aug_shift)
+
     # World model
     enc_carry, enc_entries, tokens = self.enc(
-        enc_carry, obs, reset, training)
+        enc_carry, enc_obs, reset, training)
     dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
         dyn_carry, tokens, prevact, reset, training)
     losses.update(los)

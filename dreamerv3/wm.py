@@ -267,6 +267,7 @@ class NOWM(nj.Module):
   op_layers: int = 1         # number of stacked spatial operator blocks
   use_vel: bool = True       # inject per-location velocity (enc_tok delta) in assimilation
   use_cls: bool = True       # replace s2g with CLS token in AttnNO
+  cons_k: int = 0            # k-step consistency loss on h_v (0=disabled)
   # Spatial stochastic latent field: each location gets its own stoch variables.
   # Enables per-location posterior and per-location stochastic PDE forcing.
   # stoch_total = lat_size^2 * stoch; stoch/classes are now per-location counts.
@@ -528,6 +529,33 @@ class NOWM(nj.Module):
     losses = {'dyn': dyn, 'rep': rep}
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
+
+    # k-step open-loop consistency loss on h_v.
+    # Roll _core forward k steps from posterior state; compare predicted h_v
+    # with actual posterior h_v (stop-gradient). Forces multi-step dynamics
+    # accuracy without any observation shortcuts.
+    B, T = dyn.shape[:2]
+    sp = self._sp()
+    k = self.cons_k
+    if k > 0 and T > k:
+      acts_flat = nn.cast(nn.DictConcat(self.act_space, 1)(acts))  # (B, T, act_dim)
+      pred_deter = nn.cast(entries['deter'][:, :T - k])            # (B, T-k, sp+D)
+      pred_stoch = nn.cast(entries['stoch'][:, :T - k])            # (B, T-k, stoch, cls)
+      for step in range(k):
+        act_step = acts_flat[:, step + 1: T - k + step + 1]        # (B, T-k, act_dim)
+        bt = B * (T - k)
+        pred_deter = self._core(
+            pred_deter.reshape(bt, -1),
+            pred_stoch.reshape(bt, self.stoch, self.classes),
+            act_step.reshape(bt, -1),
+        ).reshape(B, T - k, -1)
+      target_hv = sg(nn.cast(entries['deter'][:, k:, sp:]))        # (B, T-k, D)
+      cons = jnp.mean((pred_deter[..., sp:] - target_hv) ** 2, -1) # (B, T-k)
+      cons = jnp.concatenate([cons, jnp.zeros((B, k), cons.dtype)], axis=1)
+    else:
+      cons = jnp.zeros((B, T), dyn.dtype)
+    losses['cons'] = cons
+
     return carry, entries, losses, feat, metrics
 
   def _core(self, deter, stoch, action):
