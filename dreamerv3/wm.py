@@ -268,6 +268,12 @@ class NOWM(nj.Module):
   use_vel: bool = True       # inject per-location velocity (enc_tok delta) in assimilation
   use_cls: bool = True       # replace s2g with CLS token in AttnNO
   cons_k: int = 0            # k-step consistency loss on h_v (0=disabled)
+  # Global world map (egocentric-view games like Crafter).
+  # map_size=0 disables the map (Atari mode); map_size>lat_size enables it.
+  # action_deltas: flat list [dx0,dy0, dx1,dy1, ...] mapping action indices to
+  # integer pose displacements; empty = all zeros (fixed-camera games).
+  map_size: int = 0
+  action_deltas: tuple = ()
   # Spatial stochastic latent field: each location gets its own stoch variables.
   # Enables per-location posterior and per-location stochastic PDE forcing.
   # stoch_total = lat_size^2 * stoch; stoch/classes are now per-location counts.
@@ -305,10 +311,16 @@ class NOWM(nj.Module):
           [bsize, self.lat_size, self.lat_size, self.stoch, self.classes], f32)
     else:
       stoch = jnp.zeros([bsize, self.stoch, self.classes], f32)
-    return nn.cast(dict(
+    carry = nn.cast(dict(
         deter=jnp.zeros([bsize, self._total()], f32),
         stoch=stoch,
         tokens_prev=jnp.zeros([bsize, self._sp()], f32)))
+    if self.map_size > 0:
+      init_p = (self.map_size - self.lat_size) // 2
+      carry['w_s'] = jnp.zeros(
+          [bsize, self.map_size, self.map_size, self.lat_chan], f32)
+      carry['pose'] = jnp.full([bsize, 2], init_p, jnp.int32)
+    return carry
 
   def truncate(self, entries, carry=None):
     assert entries['deter'].ndim == 3, entries['deter'].shape
@@ -319,6 +331,16 @@ class NOWM(nj.Module):
     else:
       B = result['deter'].shape[0]
       result['tokens_prev'] = jnp.zeros([B, self._sp()], result['deter'].dtype)
+    if self.map_size > 0:
+      init_p = (self.map_size - self.lat_size) // 2
+      B = result['deter'].shape[0]
+      if carry is not None and 'w_s' in carry:
+        result['w_s'] = carry['w_s']
+        result['pose'] = carry['pose']
+      else:
+        result['w_s'] = jnp.zeros(
+            [B, self.map_size, self.map_size, self.lat_chan], result['deter'].dtype)
+        result['pose'] = jnp.full([B, 2], init_p, jnp.int32)
     return result
 
   def starts(self, entries, carry, nlast):
@@ -343,6 +365,22 @@ class NOWM(nj.Module):
         (carry['deter'], carry['stoch'], action, carry['tokens_prev']), ~reset)
     action = nn.DictConcat(self.act_space, 1)(action)
     action = nn.mask(action, ~reset)
+
+    # Global map: reset state at episode boundaries, then inject viewport into deter.
+    # Disabled (map_size=0) for fixed-camera games like Atari — no-op path.
+    if self.map_size > 0:
+      init_p = (self.map_size - self.lat_size) // 2
+      w_s = carry['w_s']
+      pose = carry['pose']
+      reset_b = reset.reshape(-1)                                       # (B,)
+      w_s = jnp.where(reset_b[:, None, None, None], jnp.zeros_like(w_s), w_s)
+      pose = jnp.where(reset_b[:, None], jnp.full_like(pose, init_p), pose)
+      d_pose = self._action_to_delta(action)                            # (B, 2) int32
+      new_pose = jnp.clip(pose + d_pose, 0, self.map_size - self.lat_size)
+      sp = self._sp()
+      h_s_from_map = self._read_viewport(w_s, new_pose)                 # (B, sp)
+      deter = jnp.concatenate([h_s_from_map, deter[:, sp:]], -1)
+
     deter = self._core(deter, stoch, action)
     tokens = tokens.reshape((*deter.shape[:-1], -1))
 
@@ -383,8 +421,14 @@ class NOWM(nj.Module):
       stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
     # carry/feat: deter_prior forces decoder to rely on stoch for obs info (no KL collapse).
     # entry:      deter_posterior for imagination starts (spatially-corrected state).
-    carry = dict(deter=deter_prior, stoch=stoch,
-                 tokens_prev=tokens_prev_new)
+    if self.map_size > 0:
+      # Write posterior h_s back to the global map (gated update).
+      w_s_new = self._write_viewport(w_s, deter[:, :self._sp()], h_s_from_map, new_pose)
+      carry = dict(deter=deter_prior, stoch=stoch, tokens_prev=tokens_prev_new,
+                   w_s=w_s_new, pose=new_pose)
+    else:
+      carry = dict(deter=deter_prior, stoch=stoch,
+                   tokens_prev=tokens_prev_new)
     feat = dict(deter=deter_prior, prior_deter=deter_prior, stoch=stoch, logit=logit)
     entry = dict(deter=deter, stoch=stoch)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
@@ -1073,6 +1117,58 @@ class NOWM(nj.Module):
     col_pe = jnp.broadcast_to(col_pe[None, :, :], (H, W, 2 * d))
     pe = jnp.concatenate([row_pe, col_pe], -1)                      # (H, W, C)
     return pe.reshape(H * W, C)                                      # (HW, C)
+
+  def _action_to_delta(self, action_flat):
+    """Map one-hot action to integer pose displacement (dx, dy).
+
+    action_flat: (B, n_actions) — one-hot or soft categorical.
+    Returns (B, 2) int32 deltas. All zeros when action_deltas is empty (Atari).
+    """
+    B = action_flat.shape[0]
+    if not self.action_deltas:
+      return jnp.zeros((B, 2), jnp.int32)
+    n = len(self.action_deltas) // 2
+    table = jnp.array(
+        [[self.action_deltas[i * 2], self.action_deltas[i * 2 + 1]]
+         for i in range(n)], dtype=jnp.int32)                    # (n, 2)
+    idx = jnp.clip(jnp.argmax(action_flat, axis=-1), 0, n - 1)  # (B,)
+    return table[idx]                                            # (B, 2)
+
+  def _read_viewport(self, w_s, pose):
+    """Read lat_size×lat_size viewport from global map at given pose.
+
+    w_s:  (B, map_size, map_size, lat_chan)
+    pose: (B, 2) int32 — top-left corner of viewport in map coordinates
+    Returns (B, sp) flat float — same dtype as w_s.
+    """
+    H = W = self.lat_size; C = self.lat_chan
+    zero = jnp.zeros((), jnp.int32)
+    def read_one(m, p):
+      return jax.lax.dynamic_slice(m, (p[0], p[1], zero), (H, W, C))
+    viewport = jax.vmap(read_one)(w_s, pose)                     # (B, H, W, C)
+    return viewport.reshape(w_s.shape[0], H * W * C)
+
+  def _write_viewport(self, w_s, h_s_post, h_s_prior, pose):
+    """Write posterior viewport back to global map with a learned gate.
+
+    w_s:      (B, map_size, map_size, lat_chan)
+    h_s_post: (B, sp) — posterior h_s after observation assimilation
+    h_s_prior:(B, sp) — content read from map before this step (= h_s_from_map)
+    pose:     (B, 2) int32
+    Returns updated w_s (B, map_size, map_size, lat_chan).
+    """
+    B = w_s.shape[0]; H = W = self.lat_size; C = self.lat_chan
+    post_tok = h_s_post.reshape(B, H * W, C)
+    pri_tok  = h_s_prior.reshape(B, H * W, C)
+    gate = jax.nn.sigmoid(
+        self.sub('map_gate', nn.Linear, C, **self.kw)(
+            jnp.concatenate([pri_tok, post_tok], -1)) - 1)        # (B, HW, C)
+    updated = (gate * jnp.tanh(post_tok) + (1 - gate) * pri_tok
+               ).reshape(B, H, W, C)
+    zero = jnp.zeros((), jnp.int32)
+    def write_one(m, content, p):
+      return jax.lax.dynamic_update_slice(m, content, (p[0], p[1], zero))
+    return jax.vmap(write_one)(w_s, updated, pose)
 
   def _kl_per_var(self, post_logits, prior_logits):
     """Per-variable KL (..., N) before summing — for correct per-location free_nats floor."""

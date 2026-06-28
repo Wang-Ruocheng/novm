@@ -93,7 +93,7 @@ defaults:
     ac_grads: False
     dyn:
       typ: nowm
-      nowm: {deter: 256, hidden: 256, stoch: 4, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, free_nats: 0.5, absolute: False, lat_size: 8, lat_chan: 32, spatial_op: attnno, attn_heads: 2, stoch_spatial: True, op_layers: 1, use_vel: True, use_cls: True, cons_k: 0}
+      nowm: {deter: 256, hidden: 256, stoch: 4, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, free_nats: 0.5, absolute: False, lat_size: 8, lat_chan: 32, spatial_op: attnno, attn_heads: 2, stoch_spatial: True, op_layers: 1, use_vel: True, use_cls: True, cons_k: 0, map_size: 0, action_deltas: [0, 0]}
     enc:
       typ: simple
       simple: {depth: 32, mults: [2, 3, 4], layers: 3, units: 1024, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
@@ -202,6 +202,19 @@ crafter:
   agent:
     phase1_steps: 7000    # 300k × (32/512) = 18.75k → 保守取7k
     phase1_ramp: 1000
+    imag_last: 0
+    imag_length: 15
+    imag_loss: {slowtar: True, lam: 0.99, actent: 3e-4, target_rand: 0.3, actent_rate: 3e-3, min_rand: 0.05}
+    # action_deltas: 17 actions — noop(0,0), left(-1,0), right(1,0), up(0,-1), down(0,1), rest→(0,0)
+    dyn:
+      nowm: {lat_size: 8, lat_chan: 32, spatial_op: attnno, attn_heads: 4, op_layers: 1, stoch: 32, classes: 32, stoch_spatial: False, deter: 512, hidden: 512, imglayers: 3, obslayers: 2, use_vel: False, use_cls: True, cons_k: 0, map_size: 16, action_deltas: [0,0,-1,0,1,0,0,-1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}
+    enc:
+      simple: {depth: 32, mults: [1, 1, 1]}
+    dec:
+      simple: {depth: 64, spatial_dec: True, lat_size: 8, lat_chan: 32, bspace: 8, mults: [2, 3, 4]}
+    policy: {layers: 2, units: 512}
+    value: {layers: 2, units: 512}
+    aug_shift: 0
 
 dmc_proprio:
   <<: *size1m
