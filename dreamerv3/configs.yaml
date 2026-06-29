@@ -167,6 +167,9 @@ dmlab:
 atari:
   task: atari_pong
   run: {steps: 5.1e7, train_ratio: 32}
+  agent:
+    phase1_steps: 30000
+    phase1_ramp: 5000
 
 procgen:
   task: procgen_coinrun
